@@ -56,19 +56,32 @@ def check_cuda_available() -> bool:
 
 def get_gpu_encoder_for_ffmpeg() -> Optional[str]:
     """Detect available GPU encoder for FFmpeg."""
-    # Try to detect NVIDIA NVENC
+    # Try to detect GPU encoders and verify they work
     result = run_capture([FFMPEG_EXE, "-hide_banner", "-encoders"])
     if result.returncode == 0:
         output = result.stdout.lower()
+        
         # Check for various GPU encoders in order of preference
-        if "h264_nvenc" in output or "hevc_nvenc" in output:
-            return "h264_nvenc"
-        elif "h264_qsv" in output:  # Intel Quick Sync
-            return "h264_qsv"
-        elif "h264_vaapi" in output:  # VA-API (Linux)
-            return "h264_vaapi"
-        elif "h264_videotoolbox" in output:  # macOS
-            return "h264_videotoolbox"
+        candidates = []
+        if "h264_nvenc" in output:
+            candidates.append("h264_nvenc")
+        if "h264_qsv" in output:  # Intel Quick Sync
+            candidates.append("h264_qsv")
+        if "h264_vaapi" in output:  # VA-API (Linux)
+            candidates.append("h264_vaapi")
+        if "h264_videotoolbox" in output:  # macOS
+            candidates.append("h264_videotoolbox")
+        
+        # Verify the encoder can actually be initialized
+        for encoder in candidates:
+            test_cmd = [
+                FFMPEG_EXE, "-hide_banner", "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+                "-c:v", encoder, "-f", "null", "-"
+            ]
+            test_result = run_capture(test_cmd)
+            if test_result.returncode == 0:
+                return encoder
+    
     return None
 
 # ---------------------------
