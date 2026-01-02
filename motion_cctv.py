@@ -380,6 +380,8 @@ def detect_motion_segments_opencv(
             continue
         
         processed_frame_idx += 1
+        # t_s is the actual timestamp in the video for this frame
+        # This is based on frame_idx (not processed_frame_idx) to give accurate video timestamps
         t_s = frame_idx / fps
 
         gray = prep(frame)
@@ -455,7 +457,8 @@ def detect_motion_segments_opencv(
         if (not in_event) and is_motion and motion_run >= min_motion_frames:
             in_event = True
             # backdate start to include the run-up
-            # motion_run is in processed frames, need to convert to actual time
+            # motion_run counts processed frames; multiply by frame_skip to get actual frames
+            # then divide by fps to get actual time in the video
             actual_frames_back = min_motion_frames * frame_skip
             event_start = max(0.0, t_s - (actual_frames_back / fps))
             peak_ratio = ratio
