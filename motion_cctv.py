@@ -208,8 +208,9 @@ def detect_motion_segments_opencv(
     # Enable GPU-accelerated video decoding if available
     if gpu_available:
         try:
-            # Try to use CUDA-accelerated backend
-            cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+            # Try to use CUDA-accelerated backend (if supported)
+            if hasattr(cv2, 'CAP_PROP_HW_ACCELERATION') and hasattr(cv2, 'VIDEO_ACCELERATION_ANY'):
+                cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
         except Exception:
             pass
 
@@ -267,26 +268,14 @@ def detect_motion_segments_opencv(
     # Pre-create filters and kernels outside the loop for better performance
     cpu_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     
-    # GPU resources (created once, reused for all frames)
+    # GPU resources will be initialized after first frame determines final image size
     gpu_gaussian_filter = None
     gpu_morph_open_filter = None
     gpu_morph_dilate_filter = None
-    
-    if gpu_available:
-        try:
-            # Create a test frame to determine the size for filters
-            test_fr = frame
-            if scale != 1.0:
-                test_fr = cv2.resize(test_fr, (int(w0 * scale), int(h0 * scale)), interpolation=cv2.INTER_AREA)
-            
-            # These will be created after ROI is determined in prep()
-            # For now, mark that we want to use GPU
-            pass
-        except Exception:
-            gpu_available = False
+    gpu_filters_initialized = False
 
     def prep(frame_in):
-        nonlocal roi_rect, gpu_gaussian_filter, gpu_morph_open_filter, gpu_morph_dilate_filter
+        nonlocal roi_rect, gpu_gaussian_filter, gpu_morph_open_filter, gpu_morph_dilate_filter, gpu_filters_initialized
         fr = frame_in
         
         # GPU-accelerated resize if available
@@ -323,7 +312,7 @@ def detect_motion_segments_opencv(
                 gpu_frame.upload(fr)
                 gpu_gray = cv2.cuda.cvtColor(gpu_frame, cv2.COLOR_BGR2GRAY)
                 
-                # Create Gaussian filter once on first call
+                # Create Gaussian filter once on first call (after ROI is determined)
                 if gpu_gaussian_filter is None:
                     gpu_gaussian_filter = cv2.cuda.createGaussianFilter(gpu_gray.type(), gpu_gray.type(), (5, 5), 0)
                 
@@ -377,11 +366,11 @@ def detect_motion_segments_opencv(
                 gpu_fgmask = cv2.cuda_GpuMat()
                 gpu_fgmask.upload(fgmask)
                 
-                # Create morphology filters once on first iteration
-                if gpu_morph_open_filter is None:
+                # Create morphology filters once after first frame (when size is known)
+                if not gpu_filters_initialized:
                     gpu_morph_open_filter = cv2.cuda.createMorphologyFilter(cv2.MORPH_OPEN, gpu_fgmask.type(), cpu_kernel)
-                if gpu_morph_dilate_filter is None:
                     gpu_morph_dilate_filter = cv2.cuda.createMorphologyFilter(cv2.MORPH_DILATE, gpu_fgmask.type(), cpu_kernel)
+                    gpu_filters_initialized = True
                 
                 # Apply pre-created filters
                 gpu_fgmask = gpu_morph_open_filter.apply(gpu_fgmask)
@@ -511,16 +500,22 @@ def make_clip(
                 "-i", str(input_path),
                 "-c:v", gpu_encoder,
             ]
-            # Add encoder-specific options
+            # Add encoder-specific options with appropriate quality mapping
             if "nvenc" in gpu_encoder:
-                cmd.extend(["-preset", "p4", "-cq", str(crf)])  # NVENC preset
+                # NVENC: CRF range 0-51, use preset p1-p7
+                cmd.extend(["-preset", "p4", "-cq", str(min(51, max(0, crf)))])
             elif "qsv" in gpu_encoder:
-                cmd.extend(["-preset", preset, "-global_quality", str(crf)])
+                # QSV: Use global_quality 1-51 (lower is better)
+                cmd.extend(["-preset", preset, "-global_quality", str(min(51, max(1, crf)))])
             elif "vaapi" in gpu_encoder:
-                cmd.extend(["-qp", str(crf)])
+                # VA-API: qp parameter, reasonable range 0-51
+                cmd.extend(["-qp", str(min(51, max(0, crf)))])
             elif "videotoolbox" in gpu_encoder:
-                cmd.extend(["-q:v", str(crf)])
+                # VideoToolbox: q:v parameter, 0-100 (lower is better)
+                quality = min(100, max(0, int(crf * 1.96)))  # Map 0-51 to 0-100
+                cmd.extend(["-q:v", str(quality)])
             else:
+                # Fallback for unknown encoder
                 cmd.extend(["-crf", str(crf), "-preset", preset])
             
             cmd.extend([
