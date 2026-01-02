@@ -455,7 +455,9 @@ def detect_motion_segments_opencv(
         if (not in_event) and is_motion and motion_run >= min_motion_frames:
             in_event = True
             # backdate start to include the run-up
-            event_start = max(0.0, t_s - (min_motion_frames / effective_fps))
+            # motion_run is in processed frames, need to convert to actual time
+            actual_frames_back = min_motion_frames * frame_skip
+            event_start = max(0.0, t_s - (actual_frames_back / fps))
             peak_ratio = ratio
 
         # End event only if stillness persists
