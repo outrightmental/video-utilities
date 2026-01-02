@@ -62,6 +62,29 @@ This tool instead answers the question:
 pip install opencv-python
 ```
 
+**Note:** The standard `opencv-python` package from PyPI does **not** include CUDA support.
+
+### Enabling GPU Acceleration (OpenCV CUDA)
+
+To enable CUDA acceleration in OpenCV, you need a CUDA-enabled build. Options:
+
+**Option 1: Build OpenCV from source with CUDA** (recommended for best performance)
+- Follow the official OpenCV build instructions with `-DWITH_CUDA=ON`
+- See: https://docs.opencv.org/master/d6/d15/tutorial_building_tegra_cuda.html
+
+**Option 2: Use pre-built CUDA packages** (if available for your platform)
+- Windows: Check https://github.com/opencv/opencv/releases or community builds
+- Linux: Some distributions provide `python3-opencv-cuda` packages
+
+**Verify CUDA support:**
+```python
+python -c "import cv2; print('CUDA devices:', cv2.cuda.getCudaEnabledDeviceCount())"
+```
+
+If CUDA is properly configured, this will show the number of available CUDA devices (e.g., "CUDA devices: 1").
+
+**Note:** Even without CUDA, the script will still benefit from FFmpeg hardware encoding (NVENC on NVIDIA GPUs) if you have appropriate drivers installed.
+
 FFmpeg (Windows recommended via Chocolatey):
 
 ```powershell
@@ -69,6 +92,33 @@ choco install ffmpeg
 ```
 
 Or ensure `ffmpeg.exe` and `ffprobe.exe` are on your `PATH`.
+
+---
+
+## GPU Acceleration
+
+Motion CCTV automatically detects and uses GPU acceleration when available:
+
+### OpenCV CUDA Acceleration
+- **Background subtraction (MOG2)** - runs on GPU
+- **Image resizing** - GPU-accelerated
+- **Color conversion and blur** - GPU-accelerated  
+- **Morphological operations** - GPU-accelerated
+
+### FFmpeg Hardware Encoding
+Automatically detects and uses available GPU encoders:
+- **NVIDIA NVENC** (h264_nvenc) - NVIDIA GPUs
+- **Intel Quick Sync** (h264_qsv) - Intel CPUs with iGPU
+- **VA-API** (h264_vaapi) - Linux with compatible hardware
+- **VideoToolbox** (h264_videotoolbox) - macOS
+
+### Disabling GPU
+To force CPU-only processing:
+```bash
+python motion_cctv.py /path/to/videos --no-gpu
+```
+
+GPU acceleration provides significant performance improvements (typically 2-5x faster) when processing large video files.
 
 ---
 
