@@ -200,11 +200,15 @@ def detect_motion_segments_opencv(
     roi: Optional[Tuple[float, float, float, float]],
     progress_every_s: float = 2.0,
     use_gpu: bool = True,
+    frame_skip: int = 1,
+    hwaccel_decode: bool = False,
 ) -> List[Tuple[float, float, float]]:
     """
     Returns list of (start_s, end_s, peak_motion_ratio)
     
     If use_gpu=True and CUDA is available, uses GPU-accelerated operations.
+    If frame_skip > 1, processes every Nth frame (e.g., frame_skip=2 processes every 2nd frame).
+    If hwaccel_decode=True, attempts to use hardware-accelerated video decoding.
     """
     try:
         import cv2
@@ -223,15 +227,31 @@ def detect_motion_segments_opencv(
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
 
-    # Enable GPU-accelerated video decoding if available
-    # Note: Hardware acceleration for video decoding is typically configured
-    # at OpenCV build time or through backend-specific environment variables
-    # rather than through VideoCapture properties
+    # Enable hardware-accelerated video decoding if requested
+    # OpenCV can use various hardware acceleration backends depending on build and platform
+    if hwaccel_decode and gpu_available:
+        try:
+            # Try to enable hardware acceleration via backend hints
+            # Note: This depends on how OpenCV was built and platform support
+            # On Windows with CUDA: use FFMPEG backend with CUDA
+            # On Linux: FFMPEG backend may use VAAPI/VDPAU automatically
+            cap.set(cv2.CAP_PROP_HW_ACCELERATION, cv2.VIDEO_ACCELERATION_ANY)
+            log("  [HW Decode] Hardware-accelerated decoding enabled (if supported by OpenCV build)")
+        except Exception as e:
+            log(f"  [HW Decode] Could not enable hardware decode: {e}")
+            log("  [HW Decode] Falling back to software decode")
+    elif hwaccel_decode and not gpu_available:
+        log("  [HW Decode] Hardware decode requested but CUDA not available, using software decode")
 
     # Try to get properties from OpenCV too
     cv_fps = cap.get(cv2.CAP_PROP_FPS)
     if cv_fps and cv_fps > 1:
         fps = float(cv_fps)
+
+    # Adjust effective FPS if we're skipping frames
+    effective_fps = fps / frame_skip if frame_skip > 1 else fps
+    if frame_skip > 1:
+        log(f"  [Frame Skip] Processing every {frame_skip} frame(s), effective FPS: {effective_fps:.2f}")
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if total_frames <= 0:
@@ -251,7 +271,7 @@ def detect_motion_segments_opencv(
     else:
         fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
 
-    warmup_frames = max(0, int(warmup_seconds * fps))
+    warmup_frames = max(0, int(warmup_seconds * effective_fps))
 
     in_event = False
     event_start = 0.0
@@ -347,12 +367,19 @@ def detect_motion_segments_opencv(
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
     frame_idx = 0
+    processed_frame_idx = 0  # Index of frames actually processed (after skipping)
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
         frame_idx += 1
+        
+        # Skip frames if frame_skip > 1
+        if frame_skip > 1 and (frame_idx - 1) % frame_skip != 0:
+            continue
+        
+        processed_frame_idx += 1
         t_s = frame_idx / fps
 
         gray = prep(frame)
@@ -399,7 +426,7 @@ def detect_motion_segments_opencv(
             fgmask = cv2.dilate(fgmask, cpu_kernel, iterations=1)
 
         # Ignore motion until warmup completes (let background model stabilize)
-        if frame_idx <= warmup_frames:
+        if processed_frame_idx <= warmup_frames:
             continue
 
         # Measure motion: sum area of significant contours
@@ -428,7 +455,7 @@ def detect_motion_segments_opencv(
         if (not in_event) and is_motion and motion_run >= min_motion_frames:
             in_event = True
             # backdate start to include the run-up
-            event_start = max(0.0, t_s - (min_motion_frames / fps))
+            event_start = max(0.0, t_s - (min_motion_frames / effective_fps))
             peak_ratio = ratio
 
         # End event only if stillness persists
@@ -633,9 +660,11 @@ def main():
 
     # GPU acceleration
     ap.add_argument("--no-gpu", action="store_true", help="Disable GPU acceleration (use CPU only).")
+    ap.add_argument("--hwaccel-decode", action="store_true", help="Enable hardware-accelerated video decoding (if supported).")
 
     # Detection tuning
     ap.add_argument("--downscale-width", type=int, default=640, help="Downscale width for detection (speeds up, reduces noise).")
+    ap.add_argument("--frame-skip", type=int, default=1, help="Process every Nth frame (e.g., 2 = every 2nd frame, 3 = every 3rd frame). Default: 1 (process all frames).")
     ap.add_argument("--warmup-seconds", type=float, default=2.0, help="Seconds to let background model stabilize.")
     ap.add_argument("--motion-ratio", type=float, default=0.003, help="Motion ratio threshold (fraction of ROI area). Start 0.002–0.01.")
     ap.add_argument("--min-motion-frames", type=int, default=8, help="Require motion persists this many frames to start an event.")
@@ -660,6 +689,11 @@ def main():
 
     ap.add_argument("--csv-name", type=str, default="segments.csv")
     args = ap.parse_args()
+    
+    # Validate frame_skip
+    if args.frame_skip < 1:
+        log("ERROR: --frame-skip must be at least 1")
+        sys.exit(2)
 
     in_dir = Path(args.input_folder).expanduser().resolve()
     if not in_dir.exists() or not in_dir.is_dir():
@@ -707,12 +741,14 @@ def main():
     log(f"[io] output: {out_dir}")
     log("[cfg] DETECT:"
         f" downscale_width={args.downscale_width}"
+        f" frame_skip={args.frame_skip}"
         f" warmup={args.warmup_seconds}s"
         f" motion_ratio={args.motion_ratio}"
         f" min_motion_frames={args.min_motion_frames}"
         f" min_still_frames={args.min_still_frames}"
         f" min_contour_area={args.min_contour_area}"
-        f" roi={roi}")
+        f" roi={roi}"
+        f" hwaccel_decode={args.hwaccel_decode}")
     log("[cfg] SEGMENT:"
         f" merge_gap={args.merge_gap}s"
         f" min_duration={args.min_duration}s"
@@ -771,6 +807,8 @@ def main():
                     pad_s=args.pad,
                     roi=roi,
                     use_gpu=use_gpu,
+                    frame_skip=args.frame_skip,
+                    hwaccel_decode=args.hwaccel_decode,
                 )
 
                 log(f"[detect] segments={len(segs)}")
