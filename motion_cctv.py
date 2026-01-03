@@ -469,7 +469,7 @@ def detect_motion_segments_opencv(
         if (not in_event) and is_motion and motion_run >= min_motion_frames:
             in_event = True
             # Set start to current frame time since motion has already been sustained
-            # Padding will be added later to include some pre-motion context
+            # Padding (pad_s) will be subtracted from start later (line 506) to include pre-motion context
             event_start = t_s
             peak_ratio = ratio
 
@@ -477,6 +477,7 @@ def detect_motion_segments_opencv(
         if in_event and (still_run >= min_still_frames):
             # Backdate end to when motion actually stopped (before stillness began)
             # still_run counts processed frames; multiply by frame_skip to get actual frames
+            # Padding (pad_s) will be added to end later (line 507) to include post-motion context
             actual_frames_back = min_still_frames * frame_skip
             event_end = max(event_start, t_s - (actual_frames_back / fps))
             segments.append((event_start, event_end, peak_ratio))
