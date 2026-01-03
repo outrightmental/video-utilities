@@ -58,7 +58,7 @@ def find_exe(name: str) -> Optional[str]:
             candidates = [
                 r"C:\ProgramData\chocolatey\bin\ffprobe.exe",
                 r"C:\ffmpeg\bin\ffprobe.exe",
-                r"C:\Program Files\ffprobe\bin\ffprobe.exe",
+                r"C:\Program Files\ffmpeg\bin\ffprobe.exe",
                 r"C:\Program Files (x86)\ffmpeg\bin\ffprobe.exe",
             ]
         for c in candidates:
@@ -140,7 +140,7 @@ def get_video_specs(ffprobe_exe: str, path: Path) -> dict:
                     num, den = fr.split("/")
                     if float(den) != 0:
                         fps = float(num) / float(den)
-                except:
+                except (ValueError, ZeroDivisionError):
                     pass
             
             return {
