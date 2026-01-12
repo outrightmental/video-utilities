@@ -289,6 +289,76 @@ Many security cameras store audio as **`pcm_mulaw` inside MP4**, which breaks st
 
 ---
 
+## Concatenating Clips
+
+The repository includes a utility script `concat_clips.py` for combining multiple video files into a single output file.
+
+### Usage
+
+Recursively concatenate all video files in a directory:
+
+```bash
+python concat_clips.py /path/to/videos output.mp4
+```
+
+Non-recursive (only process files in the specified directory):
+
+```bash
+python concat_clips.py /path/to/videos output.mp4 --no-recursive
+```
+
+Custom ffmpeg/ffprobe paths:
+
+```bash
+python concat_clips.py /path/to/videos output.mp4 --ffmpeg /custom/path/ffmpeg --ffprobe /custom/path/ffprobe
+```
+
+### Features
+
+- **Recursive scanning**: Finds all video files in subdirectories by default
+- **Spec preservation**: Automatically detects video specs (codec, resolution, framerate) from the first clip
+- **Smart re-encoding**: Re-encodes clips that don't match the target specs to ensure smooth concatenation
+- **Multiple formats**: Supports mp4, avi, mkv, mov, flv, wmv, webm, m4v, mpg, mpeg
+- **Safe concatenation**: Uses FFmpeg concat demuxer with temporary files for intermediate processing
+
+### How It Works
+
+1. Scans the input directory for video files (recursively by default)
+2. Extracts video specs (resolution, framerate, codec) from the first video file
+3. For each subsequent video:
+   - If specs match, uses the original file (fast, no re-encoding)
+   - If specs differ, re-encodes to match the first video's specs
+4. Concatenates all processed videos using FFmpeg's concat demuxer
+5. Outputs a single video file with consistent encoding throughout
+
+### Requirements
+
+- FFmpeg and FFprobe must be installed and available on PATH
+- Same requirements as `motion_cctv.py` (see [Requirements](#requirements) section above)
+
+### Example Use Cases
+
+**Combine motion clips from multiple cameras:**
+
+```bash
+python concat_clips.py /path/to/motion_output/Camera1/ combined_camera1.mp4
+```
+
+**Merge all clips in a folder with different resolutions:**
+
+```bash
+# The script automatically re-encodes to match the first clip
+python concat_clips.py /path/to/mixed_videos/ unified_output.mp4
+```
+
+**Process only specific directory without subdirectories:**
+
+```bash
+python concat_clips.py /path/to/specific_folder/ output.mp4 --no-recursive
+```
+
+---
+
 ## Design Philosophy
 
 - Security footage is not cinematic video
