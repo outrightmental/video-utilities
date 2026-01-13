@@ -170,7 +170,7 @@ python motion_cctv.py /path/to/videos --frame-skip 3  # Every 3rd frame (3x fast
 For maximum performance on high-quality CCTV footage:
 
 ```bash
-choco install python312 /path/to/videos \
+python motion_cctv.py /path/to/videos \
   --downscale-width 640 \
   --frame-skip 2 \
   --hwaccel-decode \
