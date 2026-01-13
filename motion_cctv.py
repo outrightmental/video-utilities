@@ -681,7 +681,7 @@ def main():
 
     # Detection tuning
     ap.add_argument("--downscale-width", type=int, default=640, help="Downscale width for detection (speeds up, reduces noise).")
-    ap.add_argument("--frame-skip", type=int, default=1, help="Process every Nth frame (e.g., 2 = every 2nd frame, 3 = every 3rd frame). Default: 1 (process all frames).")
+    ap.add_argument("--frame-skip", type=int, default=2, help="Process every Nth frame (e.g., 2 = every 2nd frame, 3 = every 3rd frame). Default: 2 (process every other frame).")
     ap.add_argument("--warmup-seconds", type=float, default=2.0, help="Seconds to let background model stabilize.")
     ap.add_argument("--motion-ratio", type=float, default=0.003, help="Motion ratio threshold (fraction of ROI area). Start 0.002–0.01.")
     ap.add_argument("--min-motion-frames", type=int, default=8, help="Require motion persists this many frames to start an event.")
