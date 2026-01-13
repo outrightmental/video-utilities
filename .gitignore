@@ -1,6 +1,9 @@
 # Input files
 /input
 
+# Motion detection output
+example_footage/motion_output/
+
 # Jetbrains IDEs
 /.idea/
 
