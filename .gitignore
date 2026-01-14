@@ -3,6 +3,9 @@
 
 # Motion detection output
 example_footage/motion_output/
+test_e2e_output/
+test_subset_output/
+test_subset_workspace/
 
 # Jetbrains IDEs
 /.idea/

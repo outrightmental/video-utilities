@@ -1,4 +1,0 @@
-source_file,clip_index,start_seconds,end_seconds,duration_seconds,peak_motion_ratio,clip_path,status,error
-6min.mp4,1,167.880,182.680,14.800,0.009288,6min/6min_motion_001_167.880-182.680.mp4,ok,
-6min.mp4,2,195.240,219.960,24.720,0.049201,6min/6min_motion_002_195.240-219.960.mp4,ok,
-6min.mp4,3,233.160,306.040,72.880,0.135833,6min/6min_motion_003_233.160-306.040.mp4,ok,

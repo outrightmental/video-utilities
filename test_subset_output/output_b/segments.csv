@@ -1,3 +1,0 @@
-source_file,clip_index,start_seconds,end_seconds,duration_seconds,peak_motion_ratio,clip_path,status,error
-4min.mp4,1,110.280,124.920,14.640,0.009466,4min/4min_motion_001_110.280-124.920.mp4,ok,
-4min.mp4,2,137.640,162.360,24.720,0.050924,4min/4min_motion_002_137.640-162.360.mp4,ok,
