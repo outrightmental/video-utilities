@@ -270,28 +270,29 @@ def detect_motion_segments_opencv(
         total_frames = int(duration_s * fps)
 
     # Background subtractor tuned for CCTV-ish footage
-    # history: Number of frames used for background learning. Must be large enough to handle
-    # long-duration motion events without absorbing moving objects into the background.
-    # With frame_skip=2 and fps=30, history=500 means only 33 seconds of coverage.
-    # Use much larger history to prevent objects from becoming "background" during long events.
-    bg_history = 5000  # ~5-6 minutes of learning window with default frame_skip
-    # varThreshold: lower = more sensitive to motion, higher = only obvious motion
-    bg_var_threshold = 16
-    
+    # history: longer = more stable background; varThreshold controls sensitivity
     if gpu_available:
         try:
             # Try CUDA version first
-            fgbg = cv2.cuda.createBackgroundSubtractorMOG2(history=bg_history, varThreshold=bg_var_threshold, detectShadows=True)
-            log(f"  [GPU] Using CUDA BackgroundSubtractorMOG2 (history={bg_history}, varThreshold={bg_var_threshold})")
+            fgbg = cv2.cuda.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
+            log("  [GPU] Using CUDA BackgroundSubtractorMOG2")
         except Exception:
             gpu_available = False
-            fgbg = cv2.createBackgroundSubtractorMOG2(history=bg_history, varThreshold=bg_var_threshold, detectShadows=True)
-            log(f"  [MOG2] Using CPU BackgroundSubtractorMOG2 (history={bg_history}, varThreshold={bg_var_threshold})")
+            fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
+            log("  [GPU] CUDA MOG2 not available, using CPU version")
     else:
-        fgbg = cv2.createBackgroundSubtractorMOG2(history=bg_history, varThreshold=bg_var_threshold, detectShadows=True)
-        log(f"  [MOG2] Using CPU BackgroundSubtractorMOG2 (history={bg_history}, varThreshold={bg_var_threshold})")
+        fgbg = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
 
-    warmup_frames = max(0, int(warmup_seconds * effective_fps))
+    # Warmup period should be long enough for background model to stabilize
+    # Use at least warmup_seconds worth of frames, but cap at a reasonable maximum
+    # to avoid ignoring too much of short videos (fixes subset axiom while staying practical)
+    bg_history = 500  # Match the history value used in MOG2
+    min_warmup_from_history = int(bg_history * 0.05)  # 5% of history
+    warmup_from_seconds = int(warmup_seconds * effective_fps)
+    max_warmup_frames = int(10.0 * effective_fps)  # Cap at 10 seconds
+    warmup_frames = max(warmup_from_seconds, min(min_warmup_from_history, max_warmup_frames))
+    warmup_duration_s = warmup_frames / effective_fps
+    log(f"  [Warmup] {warmup_frames} frames ({warmup_duration_s:.1f}s) to stabilize background model")
 
     in_event = False
     event_start = 0.0
@@ -408,10 +409,21 @@ def detect_motion_segments_opencv(
         gray = prep(frame)
 
         # Apply background subtraction (GPU or CPU)
-        # Use a very slow learning rate to prevent moving objects from being absorbed into background
-        # Default (-1) uses automatic learning rate which adapts too quickly for long events
-        # Use 0.0001 to make background model very stable (only adapts to genuine background changes)
-        learning_rate = 0.0001
+        # Adaptive learning rate strategy to fix subset axiom violation:
+        # - During warmup: Fast learning to quickly establish initial background
+        # - During stillness: Moderate learning to update background to current scene
+        # - During motion: Very slow learning to prevent moving objects from being absorbed
+        # This ensures the background model represents the current static scene, not historical frames
+        if processed_frame_idx <= warmup_frames:
+            # Fast learning during warmup to quickly establish the background
+            learning_rate = -1  # Use default automatic learning rate for fast convergence
+        elif still_run > 0:
+            # Moderate learning during stillness to reset background to current scene
+            # This ensures background model stays current and doesn't drift over long videos
+            learning_rate = 0.01
+        else:
+            # Very slow learning during motion to prevent moving objects from being absorbed
+            learning_rate = 0.0001
         
         if gpu_available:
             try:
@@ -474,14 +486,19 @@ def detect_motion_segments_opencv(
         if is_motion:
             if motion_run == 0:
                 # Motion just started - record when this motion run began
-                potential_event_start = t_s
+                # Only update if we haven't recorded a start yet (potential_event_start == 0)
+                if potential_event_start == 0.0:
+                    potential_event_start = t_s
             motion_run += 1
             still_run = 0
             if in_event:
                 peak_ratio = max(peak_ratio, ratio)
         else:
             still_run += 1
-            motion_run = 0
+            # Only reset motion_run if we haven't committed to an event yet
+            # This allows brief gaps without losing track of event start
+            if not in_event:
+                motion_run = 0
 
         # Start event only if motion persists
         if (not in_event) and is_motion and motion_run >= min_motion_frames:
@@ -496,6 +513,8 @@ def detect_motion_segments_opencv(
             segments.append((event_start, event_end, peak_ratio))
             in_event = False
             peak_ratio = 0.0
+            potential_event_start = 0.0  # Reset for next event
+            motion_run = 0  # Reset motion counter for next event
 
         # Periodic progress
         now = time.time()
