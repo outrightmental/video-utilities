@@ -408,10 +408,36 @@ def detect_motion_segments_opencv(
         gray = prep(frame)
 
         # Apply background subtraction (GPU or CPU)
-        # Use a very slow learning rate to prevent moving objects from being absorbed into background
-        # Default (-1) uses automatic learning rate which adapts too quickly for long events
-        # Use 0.0001 to make background model very stable (only adapts to genuine background changes)
-        learning_rate = 0.0001
+        # 
+        # ADAPTIVE LEARNING RATE: Key insight from issue analysis:
+        # - When motion is detected, freeze the background to prevent moving objects
+        #   from being absorbed into the background model
+        # - When stillness is confirmed, update the background model aggressively
+        #   because the current frame represents "true background"
+        # 
+        # TIMING: still_run and motion_run are updated AFTER this point in the loop
+        # (around line 505). Therefore, when we read them here, we're getting values
+        # from the PREVIOUS frame's analysis. This is the intended behavior:
+        # - If previous frame was still -> we trust current frame is also still -> update background
+        # - If previous frame had motion -> current frame might still have motion -> freeze background
+        #
+        # The threshold for "confirmed stillness" uses half of min_still_frames to
+        # start updating the background sooner, providing faster adaptation.
+        confirmed_still_threshold = max(1, min_still_frames // 2)
+        
+        if still_run >= confirmed_still_threshold:
+            # Previous frame(s) were still - this is the ideal time to update the
+            # background model. Use a moderate learning rate to capture the current
+            # frame as the new background reference.
+            learning_rate = 0.01
+        elif motion_run > 0:
+            # Previous frame(s) had motion - freeze background model to prevent
+            # absorbing moving objects into the background.
+            learning_rate = 0.0
+        else:
+            # Transitional state (just started processing, or motion just ended)
+            # Use very slow learning rate for stability.
+            learning_rate = 0.0001
         
         if gpu_available:
             try:
