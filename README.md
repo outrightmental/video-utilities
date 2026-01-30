@@ -289,6 +289,97 @@ Many security cameras store audio as **`pcm_mulaw` inside MP4**, which breaks st
 
 ---
 
+## Shuffling and Concatenating with Seam Matching
+
+The repository also includes `shuffle_concat_seam.py`, which shuffles video clips into a random order and concatenates them with **seam frame matching** for smoother transitions.
+
+### The Problem
+
+When concatenating video clips that are "almost loops" (clips that end approximately where they begin, but run slightly too long), simple concatenation produces noticeable visual jumps at each clip boundary. This is because the start of each successive clip may have drifted slightly from where the previous clip ended.
+
+### The Solution
+
+`shuffle_concat_seam.py` uses **seam frame matching** to find the best starting point in each successive clip:
+
+1. Get the last frame of the preceding clip ("needle")
+2. Examine frames in the first N seconds of the successive clip ("haystack")
+3. Compare each haystack frame to the needle using pixel similarity (Gaussian blur + grayscale + MSE)
+4. Trim the successive clip to start at the best-matching frame
+
+This produces significantly smoother continuous playback.
+
+### Usage
+
+Basic usage (shuffles and concatenates clips from a folder):
+
+```bash
+python shuffle_concat_seam.py /path/to/videos output.mp4
+```
+
+With custom haystack duration (search window for matching frames):
+
+```bash
+python shuffle_concat_seam.py /path/to/videos output.mp4 --haystack-duration 2.0
+```
+
+With reproducible random ordering:
+
+```bash
+python shuffle_concat_seam.py /path/to/videos output.mp4 --seed 42
+```
+
+Recursive search for clips in subdirectories:
+
+```bash
+python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
+```
+
+### Command Line Options
+
+| Option | Description |
+|--------|-------------|
+| `--haystack-duration` | Duration in seconds to search for best matching frame (default: 1.0) |
+| `--seed` | Random seed for reproducible shuffling (default: random) |
+| `--recursive` | Search subdirectories for video files |
+| `--ffmpeg` | Path to ffmpeg executable |
+| `--ffprobe` | Path to ffprobe executable |
+
+### Requirements
+
+- FFmpeg and FFprobe must be installed and available on PATH
+- OpenCV for Python (`pip install opencv-python`)
+- NumPy (`pip install numpy`)
+
+### How It Works
+
+1. Reads all video files from the input directory
+2. Shuffles the files into a random order
+3. For the first clip: uses it as-is (no trimming)
+4. For each successive clip:
+   - Extracts the last frame from the preceding clip
+   - Samples frames in the first N seconds of the current clip
+   - Preprocesses frames (grayscale + Gaussian blur) for comparison
+   - Computes Mean Squared Error (MSE) between each candidate and the needle
+   - Selects the frame with minimum MSE as the trim start point
+   - Trims the clip using stream copy (fast) or re-encodes if specs differ
+5. Concatenates all processed clips into a single output file
+
+### Example Use Cases
+
+**Create smooth ambient loops from almost-looping clips:**
+
+```bash
+python shuffle_concat_seam.py /path/to/ambient_clips/ ambient_loop.mp4 --haystack-duration 1.5
+```
+
+**Reproducible random ordering for testing:**
+
+```bash
+python shuffle_concat_seam.py /path/to/clips/ output.mp4 --seed 12345
+```
+
+---
+
 ## Concatenating Clips
 
 The repository includes a utility script `concat_clips.py` for combining multiple video files into a single output file.
