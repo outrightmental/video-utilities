@@ -7,6 +7,9 @@ Tests that:
 2. Exactly one motion clip is produced
 3. The clip starts at approximately 00:30 and ends at approximately 01:30
    (with tolerance to account for actual motion detection in the example footage)
+
+Note: This test requires example footage to be present. If example footage
+is not available, the test will be skipped.
 """
 
 import csv
@@ -51,6 +54,15 @@ def main():
     # Setup paths
     repo_root = Path(__file__).parent
     example_footage = repo_root / "example_footage"
+    
+    # Check if example footage exists
+    if not example_footage.exists():
+        print("\n⚠️  SKIPPED: Example footage not found")
+        print(f"Expected location: {example_footage}")
+        print("This test requires example footage to run.")
+        print("To run this test, provide example footage in the expected location.")
+        return 0
+    
     output_dir = example_footage / "motion_output"
     
     # Clean up any existing output
