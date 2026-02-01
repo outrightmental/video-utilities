@@ -623,7 +623,7 @@ def shuffle_and_concatenate_videos(
                 )
                 
                 # Trim +2 additional frames from the beginning of the successive clip
-                extra_frames = 2
+                extra_frames = 1
                 trim_start += extra_frames / file_specs["fps"]
                 
                 log(f"  Best match at {trim_start:.3f}s (MSE={mse:.2f}, +{extra_frames} frames)")
