@@ -291,20 +291,24 @@ Many security cameras store audio as **`pcm_mulaw` inside MP4**, which breaks st
 
 ## Shuffling and Concatenating with Seam Matching
 
-The repository also includes `shuffle_concat_seam.py`, which shuffles video clips into a random order and concatenates them with **seam frame matching** for smoother transitions.
+The repository also includes `shuffle_concat_seam.py`, which shuffles video clips into a random order and concatenates them with **motion-aware seam frame matching** for smoother transitions.
 
 ### The Problem
 
 When concatenating video clips that are "almost loops" (clips that end approximately where they begin, but run slightly too long), simple concatenation produces noticeable visual jumps at each clip boundary. This is because the start of each successive clip may have drifted slightly from where the previous clip ended.
 
+Additionally, when source video loops have repetitive back-and-forth motion, matching a single still frame can result in a **sudden-reversal-motion seam** — the best matching frame may occur during motion in the opposite direction.
+
 ### The Solution
 
-`shuffle_concat_seam.py` uses **seam frame matching** to find the best starting point in each successive clip:
+`shuffle_concat_seam.py` uses **motion-aware seam frame matching** to find the best starting point in each successive clip:
 
-1. Get the last frame of the preceding clip ("needle")
-2. Examine frames in the first N seconds of the successive clip ("haystack")
-3. Compare each haystack frame to the needle using pixel similarity (Gaussian blur + grayscale + MSE)
-4. Trim the successive clip to start at the best-matching frame
+1. Get the last **2 consecutive frames** of the preceding clip ("needle pair")
+2. Examine pairs of consecutive frames in the first N seconds of the successive clip ("haystack")
+3. Compare each haystack frame pair to the needle pair using combined pixel similarity (sum of MSE for both frame comparisons)
+4. Trim the successive clip to start at the first frame of the best-matching pair
+
+By matching pairs of consecutive frames instead of single frames, the algorithm captures the **motion direction** and prevents sudden-reversal-motion seams.
 
 This produces significantly smoother continuous playback.
 
@@ -338,7 +342,7 @@ python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
 
 | Option | Description |
 |--------|-------------|
-| `--haystack-duration` | Duration in seconds to search for best matching frame (default: 1.0) |
+| `--haystack-duration` | Duration in seconds to search for best matching frame pair (default: 1.0) |
 | `--seed` | Random seed for reproducible shuffling (default: random) |
 | `--recursive` | Search subdirectories for video files |
 | `--ffmpeg` | Path to ffmpeg executable |
@@ -356,11 +360,11 @@ python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
 2. Shuffles the files into a random order
 3. For the first clip: uses it as-is (no trimming)
 4. For each successive clip:
-   - Extracts the last frame from the preceding clip
-   - Samples frames in the first N seconds of the current clip
+   - Extracts the last **2 consecutive frames** from the preceding clip (captures motion direction)
+   - Samples pairs of consecutive frames in the first N seconds of the current clip
    - Preprocesses frames (grayscale + Gaussian blur) for comparison
-   - Computes Mean Squared Error (MSE) between each candidate and the needle
-   - Selects the frame with minimum MSE as the trim start point
+   - Computes combined Mean Squared Error (MSE) for each pair comparison
+   - Selects the first frame of the pair with minimum combined MSE as the trim start point
    - Trims the clip using stream copy (fast) or re-encodes if specs differ
 5. Concatenates all processed clips into a single output file
 

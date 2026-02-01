@@ -9,15 +9,20 @@ Features:
 - Reads all video files in the target folder
 - Shuffles them into a random order
 - For each successive clip, trims frames from the beginning to find the best
-  matching frame (closest to the last frame of the preceding clip)
+  matching frame pair (closest to the last 2 frames of the preceding clip)
+- Motion-aware matching: by comparing pairs of consecutive frames, captures
+  motion direction to prevent sudden-reversal-motion seams when source clips
+  have repetitive back-and-forth motion
 - Creates a smooth continuous sequence by minimizing visual jumps between clips
 - Uses industry-standard frame comparison (Gaussian blur, grayscale, MSE)
 
 Algorithm:
-1. Get the last frame of the preceding clip ("needle")
-2. Examine frames in the first N seconds of the successive clip ("haystack")
-3. Compare each haystack frame to the needle using pixel difference
-4. Select the frame with the minimum difference as the trim start point
+1. Get the last 2 consecutive frames of the preceding clip ("needle pair")
+2. Examine frame pairs in the first N seconds of the successive clip ("haystack")
+3. Compare each pair of consecutive haystack frames to the needle pair using
+   combined pixel difference (sum of MSE for both frame comparisons)
+4. Select the first frame of the pair with minimum combined difference as the
+   trim start point
 5. Concatenate all clips with the determined trim points
 
 Requires:
@@ -244,6 +249,73 @@ def get_last_frame(ffmpeg_exe: str, ffprobe_exe: str, video_path: Path, tmpdir: 
         except OSError:
             pass
 
+
+def get_last_two_frames(ffmpeg_exe: str, ffprobe_exe: str, video_path: Path, tmpdir: Path) -> Optional[Tuple[Any, Any]]:
+    """Extract and return the last 2 consecutive frames of a video as numpy arrays.
+    
+    This is used for motion-aware seam matching: matching 2 consecutive frames
+    captures motion direction, preventing sudden-reversal-motion seams when
+    source clips have repetitive back-and-forth motion.
+    
+    Returns:
+        Tuple of (second_to_last_frame, last_frame) or None if extraction fails.
+        The frames are in chronological order: frame[0] occurs before frame[1].
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for frame comparison. Install with: pip install opencv-python")
+    
+    specs = get_video_specs(ffprobe_exe, video_path)
+    duration = specs["duration"]
+    fps = specs["fps"] if specs["fps"] > 0 else 30.0
+    
+    if duration <= 0:
+        log(f"  WARNING: Could not determine duration for {video_path.name}")
+        return None
+    
+    # Calculate frame interval
+    frame_interval = 1.0 / fps
+    
+    # Get the last frame time (slightly before end to avoid edge cases)
+    offset = min(0.1, duration * 0.5)
+    last_frame_time = max(0, duration - offset)
+    
+    # Get the second-to-last frame time (one frame before the last)
+    second_to_last_time = max(0, last_frame_time - frame_interval)
+    
+    frame_path_1 = tmpdir / "last_frame_1.png"
+    frame_path_2 = tmpdir / "last_frame_2.png"
+    
+    try:
+        # Extract second-to-last frame
+        if not extract_frame_at_time(ffmpeg_exe, video_path, second_to_last_time, frame_path_1):
+            log(f"  WARNING: Could not extract second-to-last frame from {video_path.name}")
+            return None
+        
+        # Extract last frame
+        if not extract_frame_at_time(ffmpeg_exe, video_path, last_frame_time, frame_path_2):
+            log(f"  WARNING: Could not extract last frame from {video_path.name}")
+            return None
+        
+        frame1 = cv2.imread(str(frame_path_1))
+        frame2 = cv2.imread(str(frame_path_2))
+        
+        if frame1 is None:
+            log(f"  WARNING: Could not read second-to-last frame from {video_path.name}")
+            return None
+        if frame2 is None:
+            log(f"  WARNING: Could not read last frame from {video_path.name}")
+            return None
+        
+        return (frame1, frame2)
+    finally:
+        # Ensure cleanup even on exceptions
+        for frame_path in (frame_path_1, frame_path_2):
+            try:
+                if frame_path.exists():
+                    frame_path.unlink()
+            except OSError:
+                pass
+
 def preprocess_frame_for_comparison(frame: Any, blur_size: int = 5) -> Any:
     """Preprocess frame for comparison: grayscale + Gaussian blur."""
     # Convert to grayscale
@@ -364,6 +436,183 @@ def find_best_matching_frame(
             batch_dir.rmdir()
         except OSError:
             pass
+    
+    return best_time, best_mse
+
+
+def find_best_matching_frame_pair(
+    ffmpeg_exe: str,
+    needle_frames: Tuple[Any, Any],
+    video_path: Path,
+    haystack_duration: float,
+    fps: float,
+    tmpdir: Path
+) -> Tuple[float, float]:
+    """Find the pair of consecutive frames in the haystack that best matches the needle pair.
+    
+    This function implements motion-aware seam matching: by matching 2 consecutive frames
+    instead of a single frame, we capture the motion direction and prevent sudden-reversal
+    motion seams when source clips have repetitive back-and-forth motion.
+    
+    Args:
+        ffmpeg_exe: Path to ffmpeg executable
+        needle_frames: Tuple of (second_to_last_frame, last_frame) from the preceding clip
+        video_path: Path to the successor video to search in
+        haystack_duration: Duration in seconds to search for best matching frame pair
+        fps: Frames per second of the video
+        tmpdir: Temporary directory for frame extraction
+    
+    Returns:
+        Tuple of (best_time_seconds, best_combined_mse_score)
+        best_time_seconds is the time of the first frame of the best-matching pair
+        (this becomes the trim start point of the successor clip).
+        Returns (0.0, inf) if no valid frames could be compared.
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for frame comparison. Install with: pip install opencv-python")
+    
+    # Ensure haystack_duration is valid
+    if haystack_duration <= 0:
+        return 0.0, float('inf')
+    
+    # Preprocess needle frames
+    needle_frame1, needle_frame2 = needle_frames
+    needle1_processed = preprocess_frame_for_comparison(needle_frame1)
+    needle2_processed = preprocess_frame_for_comparison(needle_frame2)
+    
+    # Calculate frame interval based on fps
+    effective_fps = fps if fps > 0 else 30.0
+    frame_interval = 1.0 / effective_fps
+    
+    best_time = 0.0
+    best_mse = float('inf')
+    pairs_compared = 0
+    
+    # Create a subdirectory for batch extraction
+    batch_dir = tmpdir / "haystack_batch_pair"
+    batch_dir.mkdir(exist_ok=True)
+    
+    try:
+        # Extract all frames in the haystack duration using a single ffmpeg call
+        cmd = [
+            ffmpeg_exe,
+            "-ss", "0",
+            "-i", str(video_path),
+            "-t", str(haystack_duration),
+            "-vf", f"fps={effective_fps}",
+            "-y",
+            str(batch_dir / "frame_%04d.png")
+        ]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        if p.returncode != 0:
+            # Fallback: if batch extraction fails, try individual frame extraction
+            log(f"  WARNING: Batch extraction failed, falling back to individual frames")
+            return _find_best_matching_frame_pair_individual(
+                ffmpeg_exe, needle1_processed, needle2_processed, video_path, 
+                haystack_duration, frame_interval, tmpdir
+            )
+        
+        # Process extracted frames as consecutive pairs
+        frame_files = sorted(batch_dir.glob("frame_*.png"))
+        
+        # We need at least 2 frames to form a pair
+        if len(frame_files) < 2:
+            log(f"  WARNING: Not enough frames in haystack for pair matching")
+            return 0.0, float('inf')
+        
+        # Load all frames into memory for efficient pair comparison
+        haystack_frames = []
+        for frame_path in frame_files:
+            frame = cv2.imread(str(frame_path))
+            if frame is not None:
+                haystack_frames.append(preprocess_frame_for_comparison(frame))
+            else:
+                haystack_frames.append(None)
+        
+        # Compare consecutive pairs
+        for i in range(len(haystack_frames) - 1):
+            frame1 = haystack_frames[i]
+            frame2 = haystack_frames[i + 1]
+            
+            if frame1 is not None and frame2 is not None:
+                # Compute combined MSE: compare needle pair to haystack pair
+                mse1 = compute_frame_difference(needle1_processed, frame1)
+                mse2 = compute_frame_difference(needle2_processed, frame2)
+                combined_mse = mse1 + mse2
+                
+                if combined_mse < best_mse:
+                    best_mse = combined_mse
+                    # The trim start is the time of the first frame of the best pair
+                    best_time = i * frame_interval
+                
+                pairs_compared += 1
+        
+        if pairs_compared == 0:
+            log(f"  WARNING: No valid frame pairs could be compared in haystack")
+        
+    finally:
+        # Clean up batch directory
+        try:
+            for f in batch_dir.glob("*.png"):
+                f.unlink()
+            batch_dir.rmdir()
+        except OSError:
+            pass
+    
+    return best_time, best_mse
+
+
+def _find_best_matching_frame_pair_individual(
+    ffmpeg_exe: str,
+    needle1_processed: Any,
+    needle2_processed: Any,
+    video_path: Path,
+    haystack_duration: float,
+    frame_interval: float,
+    tmpdir: Path
+) -> Tuple[float, float]:
+    """Fallback: Find best matching frame pair using individual frame extraction."""
+    best_time = 0.0
+    best_mse = float('inf')
+    
+    prev_frame = None
+    prev_time = None
+    current_time = 0.0
+    frame_count = 0
+    
+    while current_time < haystack_duration:
+        frame_path = tmpdir / f"haystack_pair_frame_{frame_count:04d}.png"
+        
+        try:
+            if extract_frame_at_time(ffmpeg_exe, video_path, current_time, frame_path):
+                haystack_frame = cv2.imread(str(frame_path))
+                if haystack_frame is not None:
+                    haystack_processed = preprocess_frame_for_comparison(haystack_frame)
+                    
+                    # If we have a previous frame, compare as a pair
+                    if prev_frame is not None:
+                        mse1 = compute_frame_difference(needle1_processed, prev_frame)
+                        mse2 = compute_frame_difference(needle2_processed, haystack_processed)
+                        combined_mse = mse1 + mse2
+                        
+                        if combined_mse < best_mse:
+                            best_mse = combined_mse
+                            best_time = prev_time
+                    
+                    # Store current frame for next iteration
+                    prev_frame = haystack_processed
+                    prev_time = current_time
+        finally:
+            # Clean up frame file
+            try:
+                if frame_path.exists():
+                    frame_path.unlink()
+            except OSError:
+                pass
+        
+        current_time += frame_interval
+        frame_count += 1
     
     return best_time, best_mse
 
@@ -594,7 +843,7 @@ def shuffle_and_concatenate_videos(
         concat_list_path = tmpdir_path / "concat_list.txt"
         
         processed_files = []
-        prev_last_frame = None
+        prev_last_frames = None  # Tuple of (second_to_last_frame, last_frame) for motion-aware matching
         
         for i, video_file in enumerate(shuffled_files):
             log(f"\n[{i+1}/{len(shuffled_files)}] Processing {video_file.name}")
@@ -609,24 +858,24 @@ def shuffle_and_concatenate_videos(
             # Determine trim start time
             trim_start = 0.0
             
-            if i > 0 and prev_last_frame is not None:
-                # Find best matching frame in haystack
-                log(f"  Finding best seam match (haystack={haystack_duration:.1f}s)...")
+            if i > 0 and prev_last_frames is not None:
+                # Find best matching frame pair in haystack (motion-aware matching)
+                log(f"  Finding best seam match (haystack={haystack_duration:.1f}s, 2-frame motion matching)...")
                 
-                trim_start, mse = find_best_matching_frame(
+                trim_start, mse = find_best_matching_frame_pair(
                     ffmpeg_exe,
-                    prev_last_frame,
+                    prev_last_frames,
                     video_file,
                     haystack_duration,
                     file_specs["fps"],
                     tmpdir_path
                 )
                 
-                # Trim +2 additional frames from the beginning of the successive clip
+                # Trim +1 additional frame from the beginning of the successive clip
                 extra_frames = 1
                 trim_start += extra_frames / file_specs["fps"]
                 
-                log(f"  Best match at {trim_start:.3f}s (MSE={mse:.2f}, +{extra_frames} frames)")
+                log(f"  Best match at {trim_start:.3f}s (combined MSE={mse:.2f}, +{extra_frames} frames)")
             
             # Determine output file path
             temp_output = tmpdir_path / f"processed_{i:04d}.mp4"
@@ -653,12 +902,13 @@ def shuffle_and_concatenate_videos(
                 log(f"  Using original file (no trimming needed)")
                 processed_files.append(video_file)
             
-            # Get the last frame of this processed file for the next iteration
+            # Get the last two frames of this processed file for the next iteration
+            # Using 2 consecutive frames enables motion-aware seam matching
             processed_file = processed_files[-1]
-            prev_last_frame = get_last_frame(ffmpeg_exe, ffprobe_exe, processed_file, tmpdir_path)
+            prev_last_frames = get_last_two_frames(ffmpeg_exe, ffprobe_exe, processed_file, tmpdir_path)
             
-            if prev_last_frame is None:
-                log(f"  WARNING: Could not extract last frame for seam matching")
+            if prev_last_frames is None:
+                log(f"  WARNING: Could not extract last two frames for motion-aware seam matching")
         
         if not processed_files:
             raise ValueError("No video files could be processed successfully")
