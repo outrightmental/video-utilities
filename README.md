@@ -327,7 +327,8 @@ python shuffle_concat_seam.py --folder /path/to/videos
 # Output will be saved as /path/to/videos.mp4
 
 python shuffle_concat_seam.py --fps 20 --folder ~/Documents/Videos/MyVideo
-# Output will be saved as ~/Documents/Videos/MyVideo.mp4
+# Tilde (~) is expanded to your home directory
+# Output will be saved as /home/username/Documents/Videos/MyVideo.mp4
 ```
 
 With custom haystack duration (search window for matching frames):

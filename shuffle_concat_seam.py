@@ -997,8 +997,8 @@ Algorithm:
         """
     )
     
-    ap.add_argument("input_dir", type=str, nargs='?', help="Directory containing video files to concatenate")
-    ap.add_argument("output_file", type=str, nargs='?', help="Output file path (e.g., output.mp4)")
+    ap.add_argument("input_dir", type=str, nargs='?', default=None, help="Directory containing video files to concatenate")
+    ap.add_argument("output_file", type=str, nargs='?', default=None, help="Output file path (e.g., output.mp4)")
     ap.add_argument("--folder", type=str, default=None,
                     help="Folder containing video clips. Output will be saved as <folder>.mp4")
     ap.add_argument("--recursive", action="store_true", help="Search subdirectories for video files")
