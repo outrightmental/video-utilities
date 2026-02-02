@@ -185,6 +185,100 @@ class TestMotionAwarePairMatching(unittest.TestCase):
         self.assertLess(mse_a, mse_b)
 
 
+class TestNoTrimMode(unittest.TestCase):
+    """Test the --no-trim mode functionality."""
+    
+    @patch('shuffle_concat_seam.HAS_OPENCV', False)
+    def test_no_trim_works_without_opencv(self):
+        """Verify that --no-trim mode works even without OpenCV installed."""
+        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        import tempfile
+        
+        # Create a mock setup
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            
+            # Create a fake video file
+            fake_video = tmpdir_path / "test.mp4"
+            fake_video.write_text("fake video content")
+            
+            output_path = tmpdir_path / "output.mp4"
+            
+            # This should not raise an error about OpenCV when no_trim=True
+            try:
+                shuffle_and_concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[fake_video],
+                    output_path=output_path,
+                    haystack_duration=1.0,
+                    seed=42,
+                    output_fps=None,
+                    no_trim=True
+                )
+            except RuntimeError as e:
+                if "OpenCV is required" in str(e):
+                    self.fail("shuffle_and_concatenate_videos raised OpenCV error with no_trim=True")
+                # Other errors are okay (since we're not running real ffmpeg)
+            except Exception:
+                # Other exceptions are expected since we're not running real ffmpeg
+                pass
+    
+    @patch('shuffle_concat_seam.HAS_OPENCV', True)
+    @patch('shuffle_concat_seam.find_best_matching_frame_pair')
+    @patch('shuffle_concat_seam.get_last_two_frames')
+    def test_no_trim_skips_frame_matching(self, mock_get_last_frames, mock_find_best):
+        """Verify that no_trim=True skips the frame matching function and doesn't extract last frames."""
+        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        import tempfile
+        
+        # Create a mock setup
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            
+            # Create fake video files
+            fake_video1 = tmpdir_path / "test1.mp4"
+            fake_video1.write_text("fake video content 1")
+            fake_video2 = tmpdir_path / "test2.mp4"
+            fake_video2.write_text("fake video content 2")
+            
+            output_path = tmpdir_path / "output.mp4"
+            
+            # Try to call with no_trim=True
+            try:
+                shuffle_and_concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[fake_video1, fake_video2],
+                    output_path=output_path,
+                    haystack_duration=1.0,
+                    seed=42,
+                    output_fps=None,
+                    no_trim=True
+                )
+            except Exception:
+                # Expected to fail due to missing ffmpeg, but we can still check
+                # that find_best_matching_frame_pair and get_last_two_frames were not called
+                pass
+            
+            # Verify that frame matching was not called when no_trim=True
+            mock_find_best.assert_not_called()
+            # Verify that get_last_two_frames was also not called (not needed for no_trim mode)
+            mock_get_last_frames.assert_not_called()
+    
+    def test_no_trim_flag_default(self):
+        """Verify that no_trim defaults to False in function signature."""
+        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        import inspect
+        
+        # Get the function signature
+        sig = inspect.signature(shuffle_and_concatenate_videos)
+        no_trim_param = sig.parameters['no_trim']
+        
+        # Verify default value is False
+        self.assertEqual(no_trim_param.default, False)
+
+
 class TestDocumentation(unittest.TestCase):
     """Test that the module docstring is accurate."""
     
