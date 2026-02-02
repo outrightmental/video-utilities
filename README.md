@@ -320,6 +320,17 @@ Basic usage (shuffles and concatenates clips from a folder):
 python shuffle_concat_seam.py /path/to/videos output.mp4
 ```
 
+Automatic output naming using `--folder` option:
+
+```bash
+python shuffle_concat_seam.py --folder /path/to/videos
+# Output will be saved as /path/to/videos.mp4
+
+python shuffle_concat_seam.py --fps 20 --folder ~/Documents/Videos/MyVideo
+# Tilde (~) is expanded to your home directory
+# Output will be saved as /home/username/Documents/Videos/MyVideo.mp4
+```
+
 With custom haystack duration (search window for matching frames):
 
 ```bash
@@ -342,9 +353,11 @@ python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
 
 | Option | Description |
 |--------|-------------|
+| `--folder` | Folder containing video clips. Output will be automatically saved as `<folder>.mp4` |
 | `--haystack-duration` | Duration in seconds to search for best matching frame pair (default: 1.0) |
 | `--seed` | Random seed for reproducible shuffling (default: random) |
 | `--recursive` | Search subdirectories for video files |
+| `--fps` | Output framerate (uses H264 bitstream remux method to set FPS) |
 | `--ffmpeg` | Path to ffmpeg executable |
 | `--ffprobe` | Path to ffprobe executable |
 

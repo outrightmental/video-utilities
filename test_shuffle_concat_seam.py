@@ -200,6 +200,12 @@ class TestDocumentation(unittest.TestCase):
         from shuffle_concat_seam import __doc__ as module_doc
         
         self.assertIn("needle pair", module_doc.lower())
+    
+    def test_module_mentions_folder_mode(self):
+        """Verify the docstring mentions the folder mode usage."""
+        from shuffle_concat_seam import __doc__ as module_doc
+        
+        self.assertIn("--folder", module_doc.lower())
 
 
 if __name__ == "__main__":
