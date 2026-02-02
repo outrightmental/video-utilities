@@ -4,6 +4,7 @@ shuffle_concat_seam.py — Shuffle and concatenate video clips with seam frame m
 
 Usage:
     python shuffle_concat_seam.py /path/to/videos output.mp4
+    python shuffle_concat_seam.py --folder /path/to/videos
 
 Features:
 - Reads all video files in the target folder
@@ -978,10 +979,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
+  # Original mode with explicit output file
   python shuffle_concat_seam.py /path/to/videos output.mp4
   python shuffle_concat_seam.py /path/to/videos output.mp4 --haystack-duration 2.0
   python shuffle_concat_seam.py /path/to/videos output.mp4 --seed 42
   python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
+  
+  # Folder mode with automatic output file naming
+  python shuffle_concat_seam.py --folder /path/to/videos
+  python shuffle_concat_seam.py --fps 20 --folder ~/Documents/Videos/MyVideo
 
 Algorithm:
   For each successive clip, the script examines frames in the first N seconds
@@ -991,8 +997,10 @@ Algorithm:
         """
     )
     
-    ap.add_argument("input_dir", type=str, help="Directory containing video files to concatenate")
-    ap.add_argument("output_file", type=str, help="Output file path (e.g., output.mp4)")
+    ap.add_argument("input_dir", type=str, nargs='?', help="Directory containing video files to concatenate")
+    ap.add_argument("output_file", type=str, nargs='?', help="Output file path (e.g., output.mp4)")
+    ap.add_argument("--folder", type=str, default=None,
+                    help="Folder containing video clips. Output will be saved as <folder>.mp4")
     ap.add_argument("--recursive", action="store_true", help="Search subdirectories for video files")
     ap.add_argument("--haystack-duration", type=float, default=1.0,
                     help="Duration in seconds to search for best matching frame (default: 1.0)")
@@ -1016,8 +1024,29 @@ Algorithm:
         log("ERROR: --haystack-duration must be a positive value")
         sys.exit(1)
     
+    # Determine input/output based on mode
+    if args.folder:
+        # --folder mode: derive output from folder path
+        if args.input_dir or args.output_file:
+            log("ERROR: Cannot use --folder with positional arguments input_dir and output_file")
+            sys.exit(1)
+        
+        # Expand user path (e.g., ~/)
+        folder_path = Path(args.folder).expanduser()
+        input_dir = folder_path
+        
+        # Generate output file as <folder_path>.mp4
+        output_file = folder_path.parent / (folder_path.name + ".mp4")
+    else:
+        # Original mode: use positional arguments
+        if not args.input_dir or not args.output_file:
+            log("ERROR: Either provide both input_dir and output_file, or use --folder")
+            sys.exit(1)
+        
+        input_dir = Path(args.input_dir).expanduser()
+        output_file = Path(args.output_file).expanduser()
+    
     # Validate input directory
-    input_dir = Path(args.input_dir)
     if not input_dir.exists():
         log(f"ERROR: Input directory does not exist: {input_dir}")
         sys.exit(1)
@@ -1026,7 +1055,6 @@ Algorithm:
         sys.exit(1)
     
     # Validate output file
-    output_file = Path(args.output_file)
     if output_file.exists():
         log(f"WARNING: Output file already exists and will be overwritten: {output_file}")
     
