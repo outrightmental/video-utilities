@@ -811,13 +811,14 @@ def shuffle_and_concatenate_videos(
     output_path: Path,
     haystack_duration: float = 1.0,
     seed: Optional[int] = None,
-    output_fps: Optional[float] = None
+    output_fps: Optional[float] = None,
+    no_trim: bool = False
 ) -> None:
     """Shuffle videos and concatenate with seam frame matching."""
     if not video_files:
         raise ValueError("No video files found to concatenate")
     
-    if not HAS_OPENCV:
+    if not no_trim and not HAS_OPENCV:
         raise RuntimeError("OpenCV is required for frame comparison. Install with: pip install opencv-python")
     
     if haystack_duration <= 0:
@@ -859,7 +860,7 @@ def shuffle_and_concatenate_videos(
             # Determine trim start time
             trim_start = 0.0
             
-            if i > 0 and prev_last_frames is not None:
+            if i > 0 and prev_last_frames is not None and not no_trim:
                 # Find best matching frame pair in haystack (motion-aware matching)
                 log(f"  Finding best seam match (haystack={haystack_duration:.1f}s, 2-frame motion matching)...")
                 
@@ -877,6 +878,9 @@ def shuffle_and_concatenate_videos(
                 trim_start += extra_frames / file_specs["fps"]
                 
                 log(f"  Best match at {trim_start:.3f}s (combined MSE={mse:.2f}, +{extra_frames} frames)")
+            elif no_trim:
+                # --no-trim mode: skip needle-haystack matching and use full clips
+                log(f"  Skipping seam matching (--no-trim mode)")
             
             # Determine output file path
             temp_output = tmpdir_path / f"processed_{i:04d}.mp4"
@@ -905,11 +909,13 @@ def shuffle_and_concatenate_videos(
             
             # Get the last two frames of this processed file for the next iteration
             # Using 2 consecutive frames enables motion-aware seam matching
-            processed_file = processed_files[-1]
-            prev_last_frames = get_last_two_frames(ffmpeg_exe, ffprobe_exe, processed_file, tmpdir_path)
-            
-            if prev_last_frames is None:
-                log(f"  WARNING: Could not extract last two frames for motion-aware seam matching")
+            # Skip this when using --no-trim mode to avoid unnecessary frame extraction
+            if not no_trim:
+                processed_file = processed_files[-1]
+                prev_last_frames = get_last_two_frames(ffmpeg_exe, ffprobe_exe, processed_file, tmpdir_path)
+                
+                if prev_last_frames is None:
+                    log(f"  WARNING: Could not extract last two frames for motion-aware seam matching")
         
         if not processed_files:
             raise ValueError("No video files could be processed successfully")
@@ -1010,11 +1016,13 @@ Algorithm:
                     help="Output framerate (uses H264 bitstream remux method to set FPS)")
     ap.add_argument("--ffmpeg", type=str, default=None, help="Path to ffmpeg executable")
     ap.add_argument("--ffprobe", type=str, default=None, help="Path to ffprobe executable")
+    ap.add_argument("--no-trim", action="store_true",
+                    help="Skip needle-haystack matching and use full original clips (trim start = 0)")
     
     args = ap.parse_args()
     
-    # Check OpenCV availability
-    if not HAS_OPENCV:
+    # Check OpenCV availability (not required when --no-trim is used)
+    if not HAS_OPENCV and not args.no_trim:
         log("ERROR: OpenCV is required for frame comparison.")
         log("Install with: pip install opencv-python")
         sys.exit(1)
@@ -1087,7 +1095,8 @@ Algorithm:
             output_file,
             haystack_duration=args.haystack_duration,
             seed=args.seed,
-            output_fps=args.fps
+            output_fps=args.fps,
+            no_trim=args.no_trim
         )
     except Exception as e:
         log(f"\nERROR: {e}")
