@@ -349,6 +349,12 @@ Recursive search for clips in subdirectories:
 python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
 ```
 
+Skip frame matching and concatenate full clips without trimming:
+
+```bash
+python shuffle_concat_seam.py /path/to/videos output.mp4 --no-trim
+```
+
 ### Command Line Options
 
 | Option | Description |
@@ -360,6 +366,7 @@ python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
 | `--fps` | Output framerate (uses H264 bitstream remux method to set FPS) |
 | `--ffmpeg` | Path to ffmpeg executable |
 | `--ffprobe` | Path to ffprobe executable |
+| `--no-trim` | Skip needle-haystack matching and use full original clips (trim start = 0) |
 
 ### Requirements
 
