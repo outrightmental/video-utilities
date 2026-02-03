@@ -447,7 +447,8 @@ def find_best_matching_frame_pair(
     video_path: Path,
     haystack_duration: float,
     fps: float,
-    tmpdir: Path
+    tmpdir: Path,
+    haystack_skip: float = 0.0
 ) -> Tuple[float, float]:
     """Find the pair of consecutive frames in the haystack that best matches the needle pair.
     
@@ -462,19 +463,20 @@ def find_best_matching_frame_pair(
         haystack_duration: Duration in seconds to search for best matching frame pair
         fps: Frames per second of the video
         tmpdir: Temporary directory for frame extraction
+        haystack_skip: Duration in seconds to skip at the beginning of the clip before searching
     
     Returns:
         Tuple of (best_time_seconds, best_combined_mse_score)
         best_time_seconds is the time of the first frame of the best-matching pair
         (this becomes the trim start point of the successor clip).
-        Returns (0.0, inf) if no valid frames could be compared.
+        Returns (haystack_skip, inf) if no valid frames could be compared.
     """
     if not HAS_OPENCV:
         raise RuntimeError("OpenCV is required for frame comparison. Install with: pip install opencv-python")
     
     # Ensure haystack_duration is valid
     if haystack_duration <= 0:
-        return 0.0, float('inf')
+        return haystack_skip, float('inf')
     
     # Preprocess needle frames
     needle_frame1, needle_frame2 = needle_frames
@@ -485,7 +487,7 @@ def find_best_matching_frame_pair(
     effective_fps = fps if fps > 0 else 30.0
     frame_interval = 1.0 / effective_fps
     
-    best_time = 0.0
+    best_time = haystack_skip
     best_mse = float('inf')
     pairs_compared = 0
     
@@ -497,7 +499,7 @@ def find_best_matching_frame_pair(
         # Extract all frames in the haystack duration using a single ffmpeg call
         cmd = [
             ffmpeg_exe,
-            "-ss", "0",
+            "-ss", str(haystack_skip),
             "-i", str(video_path),
             "-t", str(haystack_duration),
             "-vf", f"fps={effective_fps}",
@@ -511,7 +513,7 @@ def find_best_matching_frame_pair(
             log(f"  WARNING: Batch extraction failed, falling back to individual frames")
             return _find_best_matching_frame_pair_individual(
                 ffmpeg_exe, needle1_processed, needle2_processed, video_path, 
-                haystack_duration, frame_interval, tmpdir
+                haystack_duration, frame_interval, tmpdir, haystack_skip
             )
         
         # Process extracted frames as consecutive pairs
@@ -520,7 +522,7 @@ def find_best_matching_frame_pair(
         # We need at least 2 frames to form a pair
         if len(frame_files) < 2:
             log(f"  WARNING: Not enough frames in haystack for pair matching")
-            return 0.0, float('inf')
+            return haystack_skip, float('inf')
         
         # Load all frames into memory for efficient pair comparison
         haystack_frames = []
@@ -545,7 +547,8 @@ def find_best_matching_frame_pair(
                 if combined_mse < best_mse:
                     best_mse = combined_mse
                     # The trim start is the time of the first frame of the best pair
-                    best_time = i * frame_interval
+                    # Add haystack_skip to account for the skipped time
+                    best_time = haystack_skip + (i * frame_interval)
                 
                 pairs_compared += 1
         
@@ -571,18 +574,23 @@ def _find_best_matching_frame_pair_individual(
     video_path: Path,
     haystack_duration: float,
     frame_interval: float,
-    tmpdir: Path
+    tmpdir: Path,
+    haystack_skip: float = 0.0
 ) -> Tuple[float, float]:
-    """Fallback: Find best matching frame pair using individual frame extraction."""
-    best_time = 0.0
+    """Fallback: Find best matching frame pair using individual frame extraction.
+    
+    Args:
+        haystack_skip: Duration in seconds to skip at the beginning of the clip before searching
+    """
+    best_time = haystack_skip
     best_mse = float('inf')
     
     prev_frame = None
     prev_time = None
-    current_time = 0.0
+    current_time = haystack_skip
     frame_count = 0
     
-    while current_time < haystack_duration:
+    while current_time < haystack_skip + haystack_duration:
         frame_path = tmpdir / f"haystack_pair_frame_{frame_count:04d}.png"
         
         try:
@@ -812,9 +820,14 @@ def shuffle_and_concatenate_videos(
     haystack_duration: float = 1.0,
     seed: Optional[int] = None,
     output_fps: Optional[float] = None,
-    no_trim: bool = False
+    no_trim: bool = False,
+    haystack_skip: float = 0.0
 ) -> None:
-    """Shuffle videos and concatenate with seam frame matching."""
+    """Shuffle videos and concatenate with seam frame matching.
+    
+    Args:
+        haystack_skip: Duration in seconds to skip at the beginning of each successive clip before searching
+    """
     if not video_files:
         raise ValueError("No video files found to concatenate")
     
@@ -865,7 +878,7 @@ def shuffle_and_concatenate_videos(
                 log(f"  Skipping seam matching (--no-trim mode)")
             elif i > 0 and prev_last_frames is not None:
                 # Find best matching frame pair in haystack (motion-aware matching)
-                log(f"  Finding best seam match (haystack={haystack_duration:.1f}s, 2-frame motion matching)...")
+                log(f"  Finding best seam match (skip={haystack_skip:.2f}s, haystack={haystack_duration:.2f}s, 2-frame motion matching)...")
                 
                 trim_start, mse = find_best_matching_frame_pair(
                     ffmpeg_exe,
@@ -873,7 +886,8 @@ def shuffle_and_concatenate_videos(
                     video_file,
                     haystack_duration,
                     file_specs["fps"],
-                    tmpdir_path
+                    tmpdir_path,
+                    haystack_skip
                 )
                 
                 # Trim +1 additional frame from the beginning of the successive clip
@@ -988,18 +1002,24 @@ Example usage:
   # Original mode with explicit output file
   python shuffle_concat_seam.py /path/to/videos output.mp4
   python shuffle_concat_seam.py /path/to/videos output.mp4 --haystack-duration 2.0
+  python shuffle_concat_seam.py /path/to/videos output.mp4 --haystack-skip 1.5 --haystack-duration 2.5
   python shuffle_concat_seam.py /path/to/videos output.mp4 --seed 42
   python shuffle_concat_seam.py /path/to/videos output.mp4 --recursive
   
   # Folder mode with automatic output file naming
   python shuffle_concat_seam.py --folder /path/to/videos
   python shuffle_concat_seam.py --fps 20 --folder ~/Documents/Videos/MyVideo
+  python shuffle_concat_seam.py --fps 20 --haystack-skip 1.7 --haystack-duration 2.3 --folder test
 
 Algorithm:
   For each successive clip, the script examines frames in the first N seconds
   (haystack) and finds the frame that best matches the last frame of the 
   preceding clip (needle). The successive clip is trimmed to start at this
   best-matching frame, creating a smoother visual transition.
+  
+  With --haystack-skip, you can skip time at the beginning of each successive
+  clip before searching. For example, --haystack-skip 1.0 --haystack-duration 2.0
+  will skip the first 1.0 seconds and search from 1.0 to 3.0 seconds.
         """
     )
     
@@ -1010,6 +1030,8 @@ Algorithm:
     ap.add_argument("--recursive", action="store_true", help="Search subdirectories for video files")
     ap.add_argument("--haystack-duration", type=float, default=1.0,
                     help="Duration in seconds to search for best matching frame (default: 1.0)")
+    ap.add_argument("--haystack-skip", type=float, default=0.0,
+                    help="Duration in seconds to skip at the beginning of each successive clip before searching (default: 0.0)")
     ap.add_argument("--seed", type=int, default=None,
                     help="Random seed for reproducible shuffling (default: random)")
     ap.add_argument("--fps", type=float, default=None,
@@ -1030,6 +1052,11 @@ Algorithm:
     # Validate haystack duration
     if args.haystack_duration <= 0:
         log("ERROR: --haystack-duration must be a positive value")
+        sys.exit(1)
+    
+    # Validate haystack skip
+    if args.haystack_skip < 0:
+        log("ERROR: --haystack-skip must be non-negative")
         sys.exit(1)
     
     # Determine input/output based on mode
@@ -1096,7 +1123,8 @@ Algorithm:
             haystack_duration=args.haystack_duration,
             seed=args.seed,
             output_fps=args.fps,
-            no_trim=args.no_trim
+            no_trim=args.no_trim,
+            haystack_skip=args.haystack_skip
         )
     except Exception as e:
         log(f"\nERROR: {e}")
