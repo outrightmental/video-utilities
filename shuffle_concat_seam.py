@@ -895,6 +895,10 @@ def shuffle_and_concatenate_videos(
                 trim_start += extra_frames / file_specs["fps"]
                 
                 log(f"  Best match at {trim_start:.3f}s (combined MSE={mse:.2f}, +{extra_frames} frames)")
+            elif i > 0:
+                # Successive clip but prev_last_frames is None - this means frame extraction failed
+                # for the previous clip. Log a warning and use the full clip.
+                log(f"  WARNING: Skipping seam matching (no reference frames from previous clip)")
             
             # Determine output file path
             temp_output = tmpdir_path / f"processed_{i:04d}.mp4"

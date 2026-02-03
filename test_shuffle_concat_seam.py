@@ -277,6 +277,67 @@ class TestNoTrimMode(unittest.TestCase):
         
         # Verify default value is False
         self.assertEqual(no_trim_param.default, False)
+    
+    @patch('shuffle_concat_seam.HAS_OPENCV', True)
+    @patch('shuffle_concat_seam.find_best_matching_frame_pair')
+    @patch('shuffle_concat_seam.get_last_two_frames')
+    @patch('shuffle_concat_seam.get_video_specs')
+    def test_trim_mode_calls_frame_matching(self, mock_get_specs, mock_get_last_frames, mock_find_best):
+        """Verify that no_trim=False (default) DOES call frame matching for successive clips."""
+        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        import tempfile
+        
+        # Mock get_video_specs to return valid specs
+        mock_get_specs.return_value = {
+            'codec': 'h264',
+            'width': 1920,
+            'height': 1080,
+            'fps': 30.0,
+            'duration': 10.0
+        }
+        
+        # Mock get_last_two_frames to return a valid tuple of fake frames
+        mock_get_last_frames.return_value = (MagicMock(), MagicMock())
+        # Mock find_best_matching_frame_pair to return a trim time
+        mock_find_best.return_value = (0.5, 100.0)
+        
+        # Create a mock setup
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            
+            # Create fake video files
+            fake_video1 = tmpdir_path / "test1.mp4"
+            fake_video1.write_text("fake video content 1")
+            fake_video2 = tmpdir_path / "test2.mp4"
+            fake_video2.write_text("fake video content 2")
+            
+            output_path = tmpdir_path / "output.mp4"
+            
+            # Try to call with no_trim=False (default)
+            try:
+                shuffle_and_concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[fake_video1, fake_video2],
+                    output_path=output_path,
+                    haystack_duration=1.0,
+                    seed=42,
+                    output_fps=None,
+                    no_trim=False  # Explicitly set to False (the default)
+                )
+            except Exception:
+                # Expected to fail due to missing ffmpeg, but we can still check
+                # that find_best_matching_frame_pair WAS called for successive clips
+                pass
+            
+            # Verify that get_last_two_frames was called (to extract frames for matching)
+            # It should be called at least once for the first clip
+            self.assertTrue(mock_get_last_frames.called, 
+                "get_last_two_frames should be called when no_trim=False")
+            
+            # Verify that find_best_matching_frame_pair was called for the second clip
+            self.assertTrue(mock_find_best.called,
+                "find_best_matching_frame_pair should be called for successive clips when no_trim=False")
 
 
 class TestDocumentation(unittest.TestCase):
