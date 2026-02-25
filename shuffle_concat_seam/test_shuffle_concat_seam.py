@@ -500,11 +500,14 @@ class TestConcatenationIntegrity(unittest.TestCase):
             probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=60)
 
             # Collect any non-frame lines from combined stdout+stderr (ffprobe prints
-            # warnings to stderr and frame data to stdout)
+            # warnings to stderr and frame data to stdout).
+            # Filter out cosmetic SEI warnings — libx264 embeds encoder-metadata
+            # SEI NAL units ("User Data Unregistered") that ffprobe may report at
+            # clip boundaries.  These do not affect playability.
             warnings = []
             for line in probe.stderr.splitlines():
                 line_stripped = line.strip()
-                if line_stripped:
+                if line_stripped and "SEI" not in line_stripped:
                     warnings.append(line_stripped)
 
             self.assertEqual(
