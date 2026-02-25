@@ -282,10 +282,12 @@ class TestNoTrimMode(unittest.TestCase):
         self.assertEqual(no_trim_param.default, False)
     
     @patch('shuffle_concat_seam.shuffle_concat_seam.HAS_OPENCV', True)
+    @patch('shuffle_concat_seam.shuffle_concat_seam.trim_video_reencode')
     @patch('shuffle_concat_seam.shuffle_concat_seam.find_best_matching_frame_pair')
     @patch('shuffle_concat_seam.shuffle_concat_seam.get_last_two_frames')
     @patch('shuffle_concat_seam.shuffle_concat_seam.get_video_specs')
-    def test_trim_mode_calls_frame_matching(self, mock_get_specs, mock_get_last_frames, mock_find_best):
+    def test_trim_mode_calls_frame_matching(self, mock_get_specs, mock_get_last_frames,
+                                            mock_find_best, mock_reencode):
         """Verify that no_trim=False (default) DOES call frame matching for successive clips."""
         from shuffle_concat_seam.shuffle_concat_seam import shuffle_and_concatenate_videos
         import tempfile
@@ -303,6 +305,8 @@ class TestNoTrimMode(unittest.TestCase):
         mock_get_last_frames.return_value = (MagicMock(), MagicMock())
         # Mock find_best_matching_frame_pair to return a trim time
         mock_find_best.return_value = (0.5, 100.0)
+        # Mock trim_video_reencode to succeed (needed for codec consistency re-encode)
+        mock_reencode.return_value = True
         
         # Create a mock setup
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -343,6 +347,65 @@ class TestNoTrimMode(unittest.TestCase):
             # Verify that find_best_matching_frame_pair was called for the second clip
             self.assertTrue(mock_find_best.called,
                 "find_best_matching_frame_pair should be called for successive clips when no_trim=False")
+
+
+    @patch('shuffle_concat_seam.shuffle_concat_seam.HAS_OPENCV', True)
+    @patch('shuffle_concat_seam.shuffle_concat_seam.trim_video_reencode')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.find_best_matching_frame_pair')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.get_last_two_frames')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.get_video_specs')
+    def test_first_clip_reencoded_for_consistency(self, mock_get_specs, mock_get_last_frames,
+                                                   mock_find_best, mock_reencode):
+        """Verify that the first clip is re-encoded for codec consistency when no_trim=False.
+
+        Without this, the concat demuxer mixes the original encoding (possibly with
+        B-frames, different SPS/PPS) with re-encoded trimmed clips, producing
+        broken output.
+        """
+        from shuffle_concat_seam.shuffle_concat_seam import shuffle_and_concatenate_videos
+
+        mock_get_specs.return_value = {
+            'codec': 'h264',
+            'width': 1920,
+            'height': 1080,
+            'fps': 30.0,
+            'duration': 10.0
+        }
+        mock_get_last_frames.return_value = (MagicMock(), MagicMock())
+        mock_find_best.return_value = (0.5, 100.0)
+        # Let re-encode succeed and produce a temp file
+        mock_reencode.return_value = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+
+            fake_video1 = tmpdir_path / "test1.mp4"
+            fake_video1.write_bytes(b'\x00\x00\x00\x00')
+            fake_video2 = tmpdir_path / "test2.mp4"
+            fake_video2.write_bytes(b'\x00\x00\x00\x00')
+
+            output_path = tmpdir_path / "output.mp4"
+
+            try:
+                shuffle_and_concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[fake_video1, fake_video2],
+                    output_path=output_path,
+                    haystack_duration=1.0,
+                    seed=42,
+                    output_fps=None,
+                    no_trim=False
+                )
+            except (RuntimeError, subprocess.CalledProcessError, OSError):
+                pass
+
+            # The first clip has trim_start=0 and matching specs, so it hits the
+            # else branch.  With the fix, trim_video_reencode should be called
+            # with start_time=0.0 for that first clip to ensure codec consistency.
+            first_call_args = mock_reencode.call_args_list[0]
+            self.assertAlmostEqual(first_call_args[0][3], 0.0,
+                msg="First clip should be re-encoded with start_time=0.0 for consistency")
 
 
 class TestDocumentation(unittest.TestCase):

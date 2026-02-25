@@ -968,9 +968,21 @@ def shuffle_and_concatenate_videos(
                         log(f"  WARNING: Skipping file due to trimming failure")
                         continue
             else:
-                # No trimming needed, specs match - use original
-                log(f"  Using original file (no trimming needed)")
-                processed_files.append(video_file)
+                # No trimming needed, specs match
+                if not no_trim and len(shuffled_files) > 1:
+                    # Re-encode for consistent codec parameters with trimmed clips.
+                    # Without this, the concat demuxer (-c copy) mixes the original
+                    # encoding (which may use B-frames, different SPS/PPS) with
+                    # re-encoded trimmed clips, producing broken output.
+                    log(f"  Re-encoding for codec consistency (no trimming, lossless)...")
+                    if trim_video_reencode(ffmpeg_exe, video_file, temp_output, 0.0, target_specs):
+                        processed_files.append(temp_output)
+                    else:
+                        log(f"  WARNING: Re-encoding for consistency failed, using original file")
+                        processed_files.append(video_file)
+                else:
+                    log(f"  Using original file (no trimming needed)")
+                    processed_files.append(video_file)
             
             # Get the last two frames of this processed file for the next iteration
             # Using 2 consecutive frames enables motion-aware seam matching
