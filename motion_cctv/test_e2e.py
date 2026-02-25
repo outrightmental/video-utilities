@@ -52,7 +52,8 @@ def main():
     print("=" * 80)
     
     # Setup paths
-    repo_root = Path(__file__).parent
+    script_dir = Path(__file__).parent
+    repo_root = script_dir.parent
     example_footage = repo_root / "example_footage"
 
     # Check if example footage exists
@@ -77,7 +78,7 @@ def main():
     print("\n[Step 1] Running motion_cctv.py on example footage...")
     cmd = [
         sys.executable,
-        str(repo_root / "motion_cctv.py"),
+        str(script_dir / "motion_cctv.py"),
         str(example_footage),
         "--merge-gap", "15.0",  # Merge segments within 15 seconds
         "--min-duration", "50.0"  # Only keep segments longer than 50 seconds

@@ -19,6 +19,10 @@ try:
 except ImportError:
     HAS_OPENCV = False
 
+# Add the script's directory to sys.path for imports
+import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 # Import functions from shuffle_concat_seam
 if HAS_OPENCV:
     from shuffle_concat_seam import (
