@@ -5,8 +5,10 @@ Unit tests for shuffle_concat_seam.py
 Tests the core frame matching functions to ensure motion-aware seam matching works correctly.
 """
 
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
@@ -364,6 +366,91 @@ class TestDocumentation(unittest.TestCase):
         from shuffle_concat_seam.shuffle_concat_seam import __doc__ as module_doc
         
         self.assertIn("--folder", module_doc.lower())
+
+
+class TestConcatenationIntegrity(unittest.TestCase):
+    """Integration test: concatenate test footage and verify stream integrity with ffprobe."""
+
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    TEST_FOOTAGE_DIR = SCRIPT_DIR / "test_footage"
+
+    @classmethod
+    def _has_ffprobe(cls) -> bool:
+        return shutil.which("ffprobe") is not None
+
+    @classmethod
+    def _has_ffmpeg(cls) -> bool:
+        return shutil.which("ffmpeg") is not None
+
+    def _skip_if_missing(self):
+        if not self.TEST_FOOTAGE_DIR.exists():
+            self.skipTest(f"Test footage not found at {self.TEST_FOOTAGE_DIR}")
+        mp4s = list(self.TEST_FOOTAGE_DIR.glob("*.mp4"))
+        if len(mp4s) < 2:
+            self.skipTest("Need at least 2 mp4 files in test_footage/")
+
+        # Verify files are real video (not LFS pointers)
+        first = mp4s[0]
+        with open(first, "rb") as f:
+            header = f.read(16)
+        if b"git-lfs" in header or b"version https://git-lfs" in header:
+            self.skipTest("Test footage files are LFS pointers (not checked out)")
+
+        if not self._has_ffmpeg():
+            self.skipTest("ffmpeg not found on PATH")
+        if not self._has_ffprobe():
+            self.skipTest("ffprobe not found on PATH")
+
+    def test_concatenated_output_has_no_stream_errors(self):
+        """Run shuffle_concat_seam on test footage and verify ffprobe reports no warnings."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+
+            # Run the script
+            env = {**subprocess.os.environ, "PYTHONIOENCODING": "utf-8"}
+            cmd = [
+                sys.executable,
+                str(self.SCRIPT_DIR / "shuffle_concat_seam.py"),
+                str(self.TEST_FOOTAGE_DIR),
+                str(output_path),
+                "--seed", "1",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+            self.assertEqual(result.returncode, 0, f"Script failed:\n{result.stderr}")
+            self.assertTrue(output_path.exists(), "Output file was not created")
+            self.assertGreater(output_path.stat().st_size, 1000, "Output file is suspiciously small")
+
+            # Probe the output for warnings (SEI messages, corrupt frames, etc.)
+            probe_cmd = [
+                "ffprobe",
+                "-v", "warning",
+                "-select_streams", "v:0",
+                "-show_frames",
+                "-show_entries", "frame=pkt_pts_time,pict_type,key_frame",
+                "-of", "csv",
+                str(output_path),
+            ]
+            probe = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=60)
+
+            # Collect any non-frame lines from combined stdout+stderr (ffprobe prints
+            # warnings to stderr and frame data to stdout)
+            warnings = []
+            for line in probe.stderr.splitlines():
+                line_stripped = line.strip()
+                if line_stripped:
+                    warnings.append(line_stripped)
+
+            self.assertEqual(
+                len(warnings), 0,
+                f"ffprobe reported {len(warnings)} warning(s) on concatenated output:\n"
+                + "\n".join(warnings[:20]),
+            )
+
+            # Verify we actually got frame data
+            frame_lines = [l for l in probe.stdout.splitlines() if l.startswith("frame,")]
+            self.assertGreater(len(frame_lines), 0, "ffprobe returned no frame data")
 
 
 if __name__ == "__main__":
