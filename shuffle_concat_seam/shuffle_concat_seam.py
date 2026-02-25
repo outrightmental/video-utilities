@@ -699,7 +699,11 @@ def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_
     return True
 
 def trim_video_streamcopy(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float) -> bool:
-    """Trim video using stream copy (fast, no re-encoding) starting from a specific time."""
+    """Trim video using stream copy (fast, no re-encoding) starting from a specific time.
+    
+    WARNING: Stream copy can only cut at keyframes, so the actual start time may
+    differ from the requested start_time. Use trim_video_reencode for frame-accurate cuts.
+    """
     log(f"  Trimming {input_path.name} from {start_time:.3f}s (stream copy)...")
     
     cmd = [
@@ -717,6 +721,39 @@ def trim_video_streamcopy(ffmpeg_exe: str, input_path: Path, output_path: Path, 
         return False
     
     log(f"  Trimmed successfully")
+    return True
+
+
+def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict) -> bool:
+    """Trim video with frame-accurate seeking by re-encoding.
+    
+    Stream copy (-c copy) can only cut at keyframes, which means the actual cut
+    point may be many frames away from the requested time. For seam matching,
+    frame-accurate cuts are essential, so we re-encode.
+    """
+    log(f"  Trimming {input_path.name} from {start_time:.3f}s (re-encode for frame-accurate cut)...")
+    
+    cmd = [
+        ffmpeg_exe,
+        "-ss", str(start_time),
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-crf", "18",
+        "-s", f"{target_specs['width']}x{target_specs['height']}",
+        "-r", str(target_specs['fps']),
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-y",
+        str(output_path)
+    ]
+    
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        log(f"  ERROR: Frame-accurate trimming failed:\n{p.stderr}")
+        return False
+    
+    log(f"  Trimmed successfully (frame-accurate)")
     return True
 
 
@@ -914,12 +951,17 @@ def shuffle_and_concatenate_videos(
                     log(f"  WARNING: Skipping file due to re-encoding failure")
                     continue
             elif trim_start > 0:
-                # Need to trim, but specs match - try stream copy
-                if trim_video_streamcopy(ffmpeg_exe, video_file, temp_output, trim_start):
+                # Need to trim — re-encode for frame-accurate cut.
+                # Stream copy can only cut at keyframes, which defeats seam matching.
+                if trim_video_reencode(ffmpeg_exe, video_file, temp_output, trim_start, target_specs):
                     processed_files.append(temp_output)
                 else:
-                    log(f"  WARNING: Skipping file due to trimming failure")
-                    continue
+                    log(f"  WARNING: Frame-accurate trim failed, falling back to stream copy")
+                    if trim_video_streamcopy(ffmpeg_exe, video_file, temp_output, trim_start):
+                        processed_files.append(temp_output)
+                    else:
+                        log(f"  WARNING: Skipping file due to trimming failure")
+                        continue
             else:
                 # No trimming needed, specs match - use original
                 log(f"  Using original file (no trimming needed)")
