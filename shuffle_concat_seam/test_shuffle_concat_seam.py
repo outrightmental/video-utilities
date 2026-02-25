@@ -19,9 +19,9 @@ try:
 except ImportError:
     HAS_OPENCV = False
 
-# Import functions from shuffle_concat_seam
+# Import functions from shuffle_concat_seam module
 if HAS_OPENCV:
-    from shuffle_concat_seam import (
+    from shuffle_concat_seam.shuffle_concat_seam import (
         preprocess_frame_for_comparison,
         compute_frame_difference,
     )
@@ -189,10 +189,10 @@ class TestMotionAwarePairMatching(unittest.TestCase):
 class TestNoTrimMode(unittest.TestCase):
     """Test the --no-trim mode functionality."""
     
-    @patch('shuffle_concat_seam.HAS_OPENCV', False)
+    @patch('shuffle_concat_seam.shuffle_concat_seam.HAS_OPENCV', False)
     def test_no_trim_works_without_opencv(self):
         """Verify that --no-trim mode works even without OpenCV installed."""
-        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        from shuffle_concat_seam.shuffle_concat_seam import shuffle_and_concatenate_videos
         import tempfile
         
         # Create a mock setup
@@ -225,12 +225,12 @@ class TestNoTrimMode(unittest.TestCase):
                 # Other exceptions are expected since we're not running real ffmpeg
                 pass
     
-    @patch('shuffle_concat_seam.HAS_OPENCV', True)
-    @patch('shuffle_concat_seam.find_best_matching_frame_pair')
-    @patch('shuffle_concat_seam.get_last_two_frames')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.HAS_OPENCV', True)
+    @patch('shuffle_concat_seam.shuffle_concat_seam.find_best_matching_frame_pair')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.get_last_two_frames')
     def test_no_trim_skips_frame_matching(self, mock_get_last_frames, mock_find_best):
         """Verify that no_trim=True skips the frame matching function and doesn't extract last frames."""
-        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        from shuffle_concat_seam.shuffle_concat_seam import shuffle_and_concatenate_videos
         import tempfile
         
         # Create a mock setup
@@ -269,7 +269,7 @@ class TestNoTrimMode(unittest.TestCase):
     
     def test_no_trim_flag_default(self):
         """Verify that no_trim defaults to False in function signature."""
-        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        from shuffle_concat_seam.shuffle_concat_seam import shuffle_and_concatenate_videos
         import inspect
         
         # Get the function signature
@@ -279,13 +279,13 @@ class TestNoTrimMode(unittest.TestCase):
         # Verify default value is False
         self.assertEqual(no_trim_param.default, False)
     
-    @patch('shuffle_concat_seam.HAS_OPENCV', True)
-    @patch('shuffle_concat_seam.find_best_matching_frame_pair')
-    @patch('shuffle_concat_seam.get_last_two_frames')
-    @patch('shuffle_concat_seam.get_video_specs')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.HAS_OPENCV', True)
+    @patch('shuffle_concat_seam.shuffle_concat_seam.find_best_matching_frame_pair')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.get_last_two_frames')
+    @patch('shuffle_concat_seam.shuffle_concat_seam.get_video_specs')
     def test_trim_mode_calls_frame_matching(self, mock_get_specs, mock_get_last_frames, mock_find_best):
         """Verify that no_trim=False (default) DOES call frame matching for successive clips."""
-        from shuffle_concat_seam import shuffle_and_concatenate_videos
+        from shuffle_concat_seam.shuffle_concat_seam import shuffle_and_concatenate_videos
         import tempfile
         
         # Mock get_video_specs to return valid specs
@@ -348,20 +348,20 @@ class TestDocumentation(unittest.TestCase):
     
     def test_module_mentions_motion_aware(self):
         """Verify the docstring mentions motion-aware matching."""
-        from shuffle_concat_seam import __doc__ as module_doc
+        from shuffle_concat_seam.shuffle_concat_seam import __doc__ as module_doc
         
         self.assertIn("motion", module_doc.lower())
         self.assertIn("2 consecutive frames", module_doc.lower())
     
     def test_module_mentions_needle_pair(self):
         """Verify the algorithm description mentions needle pair."""
-        from shuffle_concat_seam import __doc__ as module_doc
+        from shuffle_concat_seam.shuffle_concat_seam import __doc__ as module_doc
         
         self.assertIn("needle pair", module_doc.lower())
     
     def test_module_mentions_folder_mode(self):
         """Verify the docstring mentions the folder mode usage."""
-        from shuffle_concat_seam import __doc__ as module_doc
+        from shuffle_concat_seam.shuffle_concat_seam import __doc__ as module_doc
         
         self.assertIn("--folder", module_doc.lower())
 
