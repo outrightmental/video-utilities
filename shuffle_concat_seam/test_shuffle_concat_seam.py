@@ -403,6 +403,8 @@ class TestNoTrimMode(unittest.TestCase):
             # The first clip has trim_start=0 and matching specs, so it hits the
             # else branch.  With the fix, trim_video_reencode should be called
             # with start_time=0.0 for that first clip to ensure codec consistency.
+            self.assertTrue(mock_reencode.called,
+                "trim_video_reencode should be called for the first clip")
             first_call_args = mock_reencode.call_args_list[0]
             self.assertAlmostEqual(first_call_args[0][3], 0.0,
                 msg="First clip should be re-encoded with start_time=0.0 for consistency")
