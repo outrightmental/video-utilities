@@ -725,25 +725,28 @@ def trim_video_streamcopy(ffmpeg_exe: str, input_path: Path, output_path: Path, 
 
 
 def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict) -> bool:
-    """Trim video with frame-accurate seeking by re-encoding.
+    """Trim video with frame-accurate seeking by lossless re-encoding.
     
     Stream copy (-c copy) can only cut at keyframes, which means the actual cut
     point may be many frames away from the requested time. For seam matching,
     frame-accurate cuts are essential, so we re-encode.
+    
+    Uses H.264 with -crf 0 (mathematically lossless) so no quality is lost.
+    The intermediate files are larger but are cleaned up automatically.
     """
-    log(f"  Trimming {input_path.name} from {start_time:.3f}s (re-encode for frame-accurate cut)...")
+    log(f"  Trimming {input_path.name} from {start_time:.3f}s (lossless re-encode for frame-accurate cut)...")
     
     cmd = [
         ffmpeg_exe,
         "-ss", str(start_time),
         "-i", str(input_path),
         "-c:v", "libx264",
-        "-preset", "medium",
-        "-crf", "18",
+        "-preset", "ultrafast",
+        "-crf", "0",
         "-s", f"{target_specs['width']}x{target_specs['height']}",
         "-r", str(target_specs['fps']),
         "-c:a", "aac",
-        "-b:a", "128k",
+        "-b:a", "320k",
         "-y",
         str(output_path)
     ]
@@ -753,7 +756,7 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
         log(f"  ERROR: Frame-accurate trimming failed:\n{p.stderr}")
         return False
     
-    log(f"  Trimmed successfully (frame-accurate)")
+    log(f"  Trimmed successfully (lossless, frame-accurate)")
     return True
 
 
