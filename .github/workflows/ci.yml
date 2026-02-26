@@ -41,6 +41,10 @@ jobs:
       run: |
         python -m unittest shuffle_concat_seam.test_shuffle_concat_seam -v
 
+    - name: Run concat_clips unit tests
+      run: |
+        python -m unittest concat_clips.test_concat_clips -v
+
     - name: Run motion_cctv e2e test
       run: |
         python motion_cctv/test_e2e.py

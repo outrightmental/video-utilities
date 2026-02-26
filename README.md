@@ -10,8 +10,8 @@ A collection of free, open-source command-line video utilities for processing, c
 
 - [Requirements](#requirements)
 - [motion\_cctv — Motion-Only Clip Extraction](#motion_cctv--motion-only-clip-extraction)
-- [shuffle\_concat\_seam — Shuffle & Concatenate with Seam Matching](#shuffle_concat_seam--shuffle--concatenate-with-seam-matching)
 - [concat\_clips — Concatenate Video Clips](#concat_clips--concatenate-video-clips)
+- [shuffle\_concat\_seam — Shuffle & Concatenate with Seam Matching](#shuffle_concat_seam--shuffle--concatenate-with-seam-matching)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -180,6 +180,9 @@ Requires example footage in `example_footage/`. The test is skipped when footage
 
 **Location:** [`shuffle_concat_seam/`](shuffle_concat_seam/)
 
+> **Note:** The functionality of this utility has been merged into [`concat_clips`](#concat_clips--concatenate-video-clips).
+> Use `concat_clips --shuffle --match-seams` for the equivalent behaviour.
+
 Shuffle video clips into a random order and concatenate them with **motion-aware seam frame matching** for smoother transitions.
 
 ### The Problem
@@ -237,33 +240,67 @@ python -m unittest shuffle_concat_seam.test_shuffle_concat_seam -v
 
 **Location:** [`concat_clips/`](concat_clips/)
 
-Recursively concatenate all video files in a directory into a single output file, re-encoding non-conformant clips to match the first clip's specs.
+Concatenate all video files in a directory into a single output file. Clips are sorted **alphabetically by filename** by default. Optional `--shuffle` and `--match-seams` flags enable random ordering and smooth motion-aware seam transitions.
 
 ### Basic Usage
 
 ```bash
+# Default: alphabetical order
 python concat_clips/concat_clips.py /path/to/videos output.mp4
+
+# Shuffle into a random order
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --shuffle
+
+# Match seams between clips for smoother transitions (requires OpenCV)
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --match-seams
+
+# Shuffle and match seams together
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams --seed 42
 ```
 
-Non-recursive:
+Automatic output naming:
 
 ```bash
-python concat_clips/concat_clips.py /path/to/videos output.mp4 --no-recursive
+python concat_clips/concat_clips.py --folder /path/to/videos
+# → /path/to/videos.mp4
 ```
+
+### Command Line Options
+
+| Option | Description |
+|--------|-------------|
+| `--shuffle` | Shuffle clips into a random order (default: alphabetical) |
+| `--seed` | Random seed for reproducible shuffling (used with `--shuffle`) |
+| `--match-seams` | Match seams between clips using motion-aware frame comparison (requires OpenCV) |
+| `--haystack-duration` | Seconds to search for best match (used with `--match-seams`, default: 1.0) |
+| `--haystack-skip` | Seconds to skip at start of each clip before searching (default: 0.0) |
+| `--folder` | Input folder; output saved as `<folder>.mp4` |
+| `--no-recursive` | Don't search subdirectories (default: recursive) |
+| `--fps` | Output framerate (H.264 bitstream remux) |
+| `--ffmpeg` / `--ffprobe` | Custom executable paths |
+
+### Seam Matching Algorithm (`--match-seams`)
+
+1. Extract the last **2 consecutive frames** of the preceding clip ("needle pair").
+2. Sample pairs of consecutive frames in the first N seconds of the next clip ("haystack").
+3. Pick the pair with the lowest combined MSE — this captures **motion direction** and prevents sudden reversals.
+4. Trim the next clip to start at that best-matching frame.
 
 ### Features
 
-- Recursive scanning (default) across subdirectories
+- Alphabetical sort by filename (default)
+- Random shuffle with optional reproducible seed (`--shuffle`, `--seed`)
+- Motion-aware seam matching for smooth transitions (`--match-seams`)
+- Recursive scanning across subdirectories (default)
 - Auto-detects codec, resolution, and framerate from the first clip
 - Smart re-encoding for clips that don't match
 - Supports mp4, avi, mkv, mov, flv, wmv, webm, m4v, mpg, mpeg
 
-### How It Works
+### Tests
 
-1. Scans input directory for video files.
-2. Extracts specs from the first file.
-3. Re-encodes non-matching files; leaves matching files untouched.
-4. Concatenates via FFmpeg concat demuxer.
+```bash
+python -m unittest concat_clips.test_concat_clips -v
+```
 
 ---
 
