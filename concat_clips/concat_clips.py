@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 concat_clips.py — Concatenate all video clips into one file.
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 motion_cctv.py — Motion-only clip extraction optimized for security camera footage.
 
