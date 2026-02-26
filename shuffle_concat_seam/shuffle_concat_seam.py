@@ -682,11 +682,13 @@ def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
         "-s", f"{target_specs['width']}x{target_specs['height']}",
         "-r", str(target_specs['fps']),
-        "-bsf:v", "filter_units=remove_types=6",
         "-c:a", "aac",
         "-b:a", "128k",
+        "-movflags", "+faststart",
         "-y",
         str(output_path)
     ]
@@ -726,16 +728,18 @@ def trim_video_streamcopy(ffmpeg_exe: str, input_path: Path, output_path: Path, 
 
 
 def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict) -> bool:
-    """Trim video with frame-accurate seeking by lossless re-encoding.
+    """Trim video with frame-accurate seeking by near-lossless re-encoding.
     
     Stream copy (-c copy) can only cut at keyframes, which means the actual cut
     point may be many frames away from the requested time. For seam matching,
     frame-accurate cuts are essential, so we re-encode.
     
-    Uses H.264 with -crf 0 (mathematically lossless) so no quality is lost.
-    The intermediate files are larger but are cleaned up automatically.
+    Uses H.264 High profile with -crf 1 (visually lossless, ~51 dB PSNR) and
+    yuv420p pixel format for broad decoder compatibility including Windows
+    Media Foundation (Photos app).  CRF 0 is avoided because it forces the
+    High 4:4:4 Predictive profile which Windows cannot decode.
     """
-    log(f"  Trimming {input_path.name} from {start_time:.3f}s (lossless re-encode for frame-accurate cut)...")
+    log(f"  Trimming {input_path.name} from {start_time:.3f}s (near-lossless re-encode for frame-accurate cut)...")
     
     cmd = [
         ffmpeg_exe,
@@ -743,12 +747,14 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
         "-i", str(input_path),
         "-c:v", "libx264",
         "-preset", "ultrafast",
-        "-crf", "0",
+        "-crf", "1",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
         "-s", f"{target_specs['width']}x{target_specs['height']}",
         "-r", str(target_specs['fps']),
-        "-bsf:v", "filter_units=remove_types=6",
         "-c:a", "aac",
         "-b:a", "320k",
+        "-movflags", "+faststart",
         "-y",
         str(output_path)
     ]
@@ -758,7 +764,7 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
         log(f"  ERROR: Frame-accurate trimming failed:\n{p.stderr}")
         return False
     
-    log(f"  Trimmed successfully (lossless, frame-accurate)")
+    log(f"  Trimmed successfully (near-lossless, frame-accurate)")
     return True
 
 
@@ -968,9 +974,21 @@ def shuffle_and_concatenate_videos(
                         log(f"  WARNING: Skipping file due to trimming failure")
                         continue
             else:
-                # No trimming needed, specs match - use original
-                log(f"  Using original file (no trimming needed)")
-                processed_files.append(video_file)
+                # No trimming needed, specs match
+                if not no_trim and len(shuffled_files) > 1:
+                    # Re-encode for consistent codec parameters with trimmed clips.
+                    # Without this, the concat demuxer (-c copy) mixes the original
+                    # encoding (which may use B-frames, different SPS/PPS) with
+                    # re-encoded trimmed clips, producing broken output.
+                    log(f"  Re-encoding for codec consistency (no trimming, lossless)...")
+                    if trim_video_reencode(ffmpeg_exe, video_file, temp_output, 0.0, target_specs):
+                        processed_files.append(temp_output)
+                    else:
+                        log(f"  WARNING: Re-encoding for consistency failed, using original file")
+                        processed_files.append(video_file)
+                else:
+                    log(f"  Using original file (no trimming needed)")
+                    processed_files.append(video_file)
             
             # Get the last two frames of this processed file for the next iteration
             # Using 2 consecutive frames enables motion-aware seam matching
@@ -1003,6 +1021,7 @@ def shuffle_and_concatenate_videos(
             "-safe", "0",
             "-i", str(concat_list_path),
             "-c", "copy",
+            "-movflags", "+faststart",
             "-y",
             str(output_path)
         ]
