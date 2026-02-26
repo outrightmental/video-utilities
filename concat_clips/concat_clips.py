@@ -1,30 +1,56 @@
 #!/usr/bin/env python3
 """
-concat_clips.py — Concatenate all video clips recursively into one file.
+concat_clips.py — Concatenate all video clips into one file.
 
 Usage:
     python concat_clips.py /path/to/videos output.mp4
+    python concat_clips.py /path/to/videos output.mp4 --shuffle
+    python concat_clips.py /path/to/videos output.mp4 --match-seams
+    python concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams
+    python concat_clips.py --folder /path/to/videos
 
 Features:
 - Recursively finds all video files in the input directory
+- Sorts clips alphabetically by filename (default)
+- Optionally shuffles clips into a random order (--shuffle)
+- Optionally matches seams between clips using motion-aware frame comparison (--match-seams)
 - Preserves video specs (codec, resolution, framerate) from the first clip
 - Re-encodes non-conformant clips to match the first clip's specs
 - Concatenates all clips using FFmpeg concat demuxer
 - Handles various video formats (mp4, avi, mkv, mov, etc.)
 
+Seam Matching Algorithm (--match-seams):
+1. Get the last 2 consecutive frames of the preceding clip ("needle pair").
+2. Examine frame pairs in the first N seconds of the successive clip ("haystack").
+3. Compare each pair of consecutive haystack frames to the needle pair using
+   combined pixel difference (sum of MSE for both frame comparisons).
+4. Select the first frame of the pair with minimum combined difference as the
+   trim start point.
+5. Concatenate all clips with the determined trim points.
+
 Requires:
 - ffmpeg + ffprobe (on PATH or pass --ffmpeg/--ffprobe)
+- OpenCV (pip install opencv-python) — only required when using --match-seams
 """
 
 import argparse
 import json
 import os
+import random
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
+
+try:
+    import cv2
+    import numpy as np
+    HAS_OPENCV = True
+except ImportError:
+    HAS_OPENCV = False
+    np = None  # type: ignore
 
 # ---------------------------
 # Safe logging (Windows codepages)
@@ -104,7 +130,7 @@ def ffprobe_json(ffprobe_exe: str, path: Path) -> dict:
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mkv", ".mov", ".flv", ".wmv", ".webm", ".m4v", ".mpg", ".mpeg"}
 
 def find_video_files(folder: Path, recursive: bool = True) -> List[Path]:
-    """Find all video files in folder (optionally recursive)."""
+    """Find all video files in folder (optionally recursive), sorted alphabetically."""
     files = []
     if recursive:
         for root, _, filenames in os.walk(folder):
@@ -123,15 +149,22 @@ def find_video_files(folder: Path, recursive: bool = True) -> List[Path]:
 # ---------------------------
 
 def get_video_specs(ffprobe_exe: str, path: Path) -> dict:
-    """Extract video codec, resolution, framerate from first video stream."""
+    """Extract video codec, resolution, framerate, and duration from first video stream."""
     info = ffprobe_json(ffprobe_exe, path)
-    
+
+    duration = 0.0
+    if "format" in info and "duration" in info["format"]:
+        try:
+            duration = float(info["format"]["duration"])
+        except (ValueError, TypeError):
+            pass
+
     for stream in info.get("streams", []):
         if stream.get("codec_type") == "video":
             codec = stream.get("codec_name", "unknown")
             width = stream.get("width", 0)
             height = stream.get("height", 0)
-            
+
             # Parse framerate
             fr = stream.get("avg_frame_rate") or stream.get("r_frame_rate")
             fps = 30.0
@@ -142,120 +175,675 @@ def get_video_specs(ffprobe_exe: str, path: Path) -> dict:
                         fps = float(num) / float(den)
                 except (ValueError, ZeroDivisionError):
                     pass
-            
+
             return {
                 "codec": codec,
                 "width": width,
                 "height": height,
                 "fps": fps,
+                "duration": duration,
             }
-    
+
     raise ValueError(f"No video stream found in {path}")
 
 def specs_match(specs1: dict, specs2: dict, tolerance: float = 0.1) -> bool:
     """Check if two video specs are compatible (within tolerance)."""
     if specs1["width"] != specs2["width"] or specs1["height"] != specs2["height"]:
         return False
-    
+
     # Allow small FPS variation
     fps_diff = abs(specs1["fps"] - specs2["fps"])
     if fps_diff > tolerance:
         return False
-    
+
     return True
 
 # ---------------------------
-# Video re-encoding
+# Frame extraction and comparison (used by --match-seams)
 # ---------------------------
 
-def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_specs: dict) -> bool:
-    """Re-encode video to match target specs."""
-    log(f"  Re-encoding {input_path.name} to match target specs...")
-    
+def extract_frame_at_time(ffmpeg_exe: str, video_path: Path, time_sec: float, output_path: Path) -> bool:
+    """Extract a single frame at the specified time."""
     cmd = [
         ffmpeg_exe,
+        "-ss", str(time_sec),
+        "-i", str(video_path),
+        "-vframes", "1",
+        "-y",
+        str(output_path)
+    ]
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return p.returncode == 0 and output_path.exists()
+
+
+def get_last_two_frames(ffmpeg_exe: str, ffprobe_exe: str, video_path: Path, tmpdir: Path) -> Optional[Tuple[Any, Any]]:
+    """Extract and return the last 2 consecutive frames of a video as numpy arrays.
+
+    This is used for motion-aware seam matching: matching 2 consecutive frames
+    captures motion direction, preventing sudden-reversal-motion seams when
+    source clips have repetitive back-and-forth motion.
+
+    Returns:
+        Tuple of (second_to_last_frame, last_frame) or None if extraction fails.
+        The frames are in chronological order: frame[0] occurs before frame[1].
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for frame comparison. Install with: pip install opencv-python")
+
+    specs = get_video_specs(ffprobe_exe, video_path)
+    duration = specs["duration"]
+    fps = specs["fps"] if specs["fps"] > 0 else 30.0
+
+    if duration <= 0:
+        log(f"  WARNING: Could not determine duration for {video_path.name}")
+        return None
+
+    # Calculate frame interval
+    frame_interval = 1.0 / fps
+
+    # Get the last frame time (slightly before end to avoid edge cases)
+    offset = min(0.1, duration * 0.5)
+    last_frame_time = max(0, duration - offset)
+
+    # Get the second-to-last frame time (one frame before the last)
+    second_to_last_time = max(0, last_frame_time - frame_interval)
+
+    frame_path_1 = tmpdir / "last_frame_1.png"
+    frame_path_2 = tmpdir / "last_frame_2.png"
+
+    try:
+        # Extract second-to-last frame
+        if not extract_frame_at_time(ffmpeg_exe, video_path, second_to_last_time, frame_path_1):
+            log(f"  WARNING: Could not extract second-to-last frame from {video_path.name}")
+            return None
+
+        # Extract last frame
+        if not extract_frame_at_time(ffmpeg_exe, video_path, last_frame_time, frame_path_2):
+            log(f"  WARNING: Could not extract last frame from {video_path.name}")
+            return None
+
+        frame1 = cv2.imread(str(frame_path_1))
+        frame2 = cv2.imread(str(frame_path_2))
+
+        if frame1 is None:
+            log(f"  WARNING: Could not read second-to-last frame from {video_path.name}")
+            return None
+        if frame2 is None:
+            log(f"  WARNING: Could not read last frame from {video_path.name}")
+            return None
+
+        return (frame1, frame2)
+    finally:
+        # Ensure cleanup even on exceptions
+        for frame_path in (frame_path_1, frame_path_2):
+            try:
+                if frame_path.exists():
+                    frame_path.unlink()
+            except OSError:
+                pass
+
+def preprocess_frame_for_comparison(frame: Any, blur_size: int = 5) -> Any:
+    """Preprocess frame for comparison: grayscale + Gaussian blur."""
+    # Convert to grayscale
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    # Apply Gaussian blur to reduce noise
+    blurred = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
+    return blurred
+
+def compute_frame_difference(frame1: Any, frame2: Any) -> float:
+    """Compute the mean squared error (MSE) between two frames.
+
+    Lower values indicate more similar frames.
+    """
+    # Validate frame dimensions
+    if frame1 is None or frame2 is None:
+        return float('inf')
+    if len(frame1.shape) < 2 or len(frame2.shape) < 2:
+        return float('inf')
+    if frame1.shape[0] == 0 or frame1.shape[1] == 0:
+        return float('inf')
+    if frame2.shape[0] == 0 or frame2.shape[1] == 0:
+        return float('inf')
+
+    # Resize to match dimensions if different
+    if frame1.shape != frame2.shape:
+        frame2 = cv2.resize(frame2, (frame1.shape[1], frame1.shape[0]))
+
+    # Compute MSE
+    diff = frame1.astype(np.float64) - frame2.astype(np.float64)
+    mse = np.mean(diff ** 2)
+    return mse
+
+def find_best_matching_frame_pair(
+    ffmpeg_exe: str,
+    needle_frames: Tuple[Any, Any],
+    video_path: Path,
+    haystack_duration: float,
+    fps: float,
+    tmpdir: Path,
+    haystack_skip: float = 0.0
+) -> Tuple[float, float]:
+    """Find the pair of consecutive frames in the haystack that best matches the needle pair.
+
+    This function implements motion-aware seam matching: by matching 2 consecutive frames
+    instead of a single frame, we capture the motion direction and prevent sudden-reversal
+    motion seams when source clips have repetitive back-and-forth motion.
+
+    Args:
+        ffmpeg_exe: Path to ffmpeg executable
+        needle_frames: Tuple of (second_to_last_frame, last_frame) from the preceding clip
+        video_path: Path to the successor video to search in
+        haystack_duration: Duration in seconds to search for best matching frame pair
+        fps: Frames per second of the video
+        tmpdir: Temporary directory for frame extraction
+        haystack_skip: Duration in seconds to skip at the beginning of the clip before searching
+
+    Returns:
+        Tuple of (best_time_seconds, best_combined_mse_score)
+        best_time_seconds is the time of the first frame of the best-matching pair
+        (this becomes the trim start point of the successor clip).
+        Returns (haystack_skip, inf) if no valid frames could be compared.
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for frame comparison. Install with: pip install opencv-python")
+
+    # Ensure haystack_duration is valid
+    if haystack_duration <= 0:
+        return haystack_skip, float('inf')
+
+    # Preprocess needle frames
+    needle_frame1, needle_frame2 = needle_frames
+    needle1_processed = preprocess_frame_for_comparison(needle_frame1)
+    needle2_processed = preprocess_frame_for_comparison(needle_frame2)
+
+    # Calculate frame interval based on fps
+    effective_fps = fps if fps > 0 else 30.0
+    frame_interval = 1.0 / effective_fps
+
+    best_time = haystack_skip
+    best_mse = float('inf')
+    pairs_compared = 0
+
+    # Create a subdirectory for batch extraction
+    batch_dir = tmpdir / "haystack_batch_pair"
+    batch_dir.mkdir(exist_ok=True)
+
+    try:
+        # Extract all frames in the haystack duration using a single ffmpeg call
+        cmd = [
+            ffmpeg_exe,
+            "-ss", str(haystack_skip),
+            "-i", str(video_path),
+            "-t", str(haystack_duration),
+            "-vf", f"fps={effective_fps}",
+            "-y",
+            str(batch_dir / "frame_%04d.png")
+        ]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        if p.returncode != 0:
+            # Fallback: if batch extraction fails, try individual frame extraction
+            log(f"  WARNING: Batch extraction failed, falling back to individual frames")
+            return _find_best_matching_frame_pair_individual(
+                ffmpeg_exe, needle1_processed, needle2_processed, video_path,
+                haystack_duration, frame_interval, tmpdir, haystack_skip
+            )
+
+        # Process extracted frames as consecutive pairs
+        frame_files = sorted(batch_dir.glob("frame_*.png"))
+
+        # We need at least 2 frames to form a pair
+        if len(frame_files) < 2:
+            log(f"  WARNING: Not enough frames in haystack for pair matching")
+            return haystack_skip, float('inf')
+
+        # Load all frames into memory for efficient pair comparison
+        haystack_frames = []
+        for frame_path in frame_files:
+            frame = cv2.imread(str(frame_path))
+            if frame is not None:
+                haystack_frames.append(preprocess_frame_for_comparison(frame))
+            else:
+                haystack_frames.append(None)
+
+        # Compare consecutive pairs
+        for i in range(len(haystack_frames) - 1):
+            frame1 = haystack_frames[i]
+            frame2 = haystack_frames[i + 1]
+
+            if frame1 is not None and frame2 is not None:
+                # Compute combined MSE: compare needle pair to haystack pair
+                mse1 = compute_frame_difference(needle1_processed, frame1)
+                mse2 = compute_frame_difference(needle2_processed, frame2)
+                combined_mse = mse1 + mse2
+
+                if combined_mse < best_mse:
+                    best_mse = combined_mse
+                    # The trim start is the time of the first frame of the best pair
+                    # Add haystack_skip to account for the skipped time
+                    best_time = haystack_skip + (i * frame_interval)
+
+                pairs_compared += 1
+
+        if pairs_compared == 0:
+            log(f"  WARNING: No valid frame pairs could be compared in haystack")
+
+    finally:
+        # Clean up batch directory
+        try:
+            for f in batch_dir.glob("*.png"):
+                f.unlink()
+            batch_dir.rmdir()
+        except OSError:
+            pass
+
+    return best_time, best_mse
+
+
+def _find_best_matching_frame_pair_individual(
+    ffmpeg_exe: str,
+    needle1_processed: Any,
+    needle2_processed: Any,
+    video_path: Path,
+    haystack_duration: float,
+    frame_interval: float,
+    tmpdir: Path,
+    haystack_skip: float = 0.0
+) -> Tuple[float, float]:
+    """Fallback: Find best matching frame pair using individual frame extraction.
+
+    Args:
+        haystack_skip: Duration in seconds to skip at the beginning of the clip before searching
+    """
+    best_time = haystack_skip
+    best_mse = float('inf')
+
+    prev_frame = None
+    prev_time = None
+    current_time = haystack_skip
+    frame_count = 0
+
+    while current_time < haystack_skip + haystack_duration:
+        frame_path = tmpdir / f"haystack_pair_frame_{frame_count:04d}.png"
+
+        try:
+            if extract_frame_at_time(ffmpeg_exe, video_path, current_time, frame_path):
+                haystack_frame = cv2.imread(str(frame_path))
+                if haystack_frame is not None:
+                    haystack_processed = preprocess_frame_for_comparison(haystack_frame)
+
+                    # If we have a previous frame, compare as a pair
+                    if prev_frame is not None:
+                        mse1 = compute_frame_difference(needle1_processed, prev_frame)
+                        mse2 = compute_frame_difference(needle2_processed, haystack_processed)
+                        combined_mse = mse1 + mse2
+
+                        if combined_mse < best_mse:
+                            best_mse = combined_mse
+                            best_time = prev_time
+
+                    # Store current frame for next iteration
+                    prev_frame = haystack_processed
+                    prev_time = current_time
+        finally:
+            # Clean up frame file
+            try:
+                if frame_path.exists():
+                    frame_path.unlink()
+            except OSError:
+                pass
+
+        current_time += frame_interval
+        frame_count += 1
+
+    return best_time, best_mse
+
+# ---------------------------
+# Video re-encoding and trimming
+# ---------------------------
+
+def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_specs: dict, start_time: float = 0.0) -> bool:
+    """Re-encode video to match target specs, optionally starting from a specific time."""
+    log(f"  Re-encoding {input_path.name} (start={start_time:.3f}s)...")
+
+    cmd = [
+        ffmpeg_exe,
+        "-ss", str(start_time),
         "-i", str(input_path),
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
         "-s", f"{target_specs['width']}x{target_specs['height']}",
         "-r", str(target_specs['fps']),
         "-c:a", "aac",
         "-b:a", "128k",
+        "-movflags", "+faststart",
         "-y",
         str(output_path)
     ]
-    
+
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
         log(f"  ERROR: Re-encoding failed:\n{p.stderr}")
         return False
-    
+
     log(f"  Re-encoded successfully")
     return True
 
+def trim_video_streamcopy(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float) -> bool:
+    """Trim video using stream copy (fast, no re-encoding) starting from a specific time.
+
+    WARNING: Stream copy can only cut at keyframes, so the actual start time may
+    differ from the requested start_time. Use trim_video_reencode for frame-accurate cuts.
+    """
+    log(f"  Trimming {input_path.name} from {start_time:.3f}s (stream copy)...")
+
+    cmd = [
+        ffmpeg_exe,
+        "-ss", str(start_time),
+        "-i", str(input_path),
+        "-c", "copy",
+        "-y",
+        str(output_path)
+    ]
+
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        log(f"  ERROR: Trimming failed:\n{p.stderr}")
+        return False
+
+    log(f"  Trimmed successfully")
+    return True
+
+
+def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict) -> bool:
+    """Trim video with frame-accurate seeking by near-lossless re-encoding.
+
+    Stream copy (-c copy) can only cut at keyframes, which means the actual cut
+    point may be many frames away from the requested time. For seam matching,
+    frame-accurate cuts are essential, so we re-encode.
+
+    Uses H.264 High profile with -crf 1 (visually lossless, ~51 dB PSNR) and
+    yuv420p pixel format for broad decoder compatibility including Windows
+    Media Foundation (Photos app).  CRF 0 is avoided because it forces the
+    High 4:4:4 Predictive profile which Windows cannot decode.
+    """
+    log(f"  Trimming {input_path.name} from {start_time:.3f}s (near-lossless re-encode for frame-accurate cut)...")
+
+    cmd = [
+        ffmpeg_exe,
+        "-ss", str(start_time),
+        "-i", str(input_path),
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "1",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-s", f"{target_specs['width']}x{target_specs['height']}",
+        "-r", str(target_specs['fps']),
+        "-c:a", "aac",
+        "-b:a", "320k",
+        "-movflags", "+faststart",
+        "-y",
+        str(output_path)
+    ]
+
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        log(f"  ERROR: Frame-accurate trimming failed:\n{p.stderr}")
+        return False
+
+    log(f"  Trimmed successfully (near-lossless, frame-accurate)")
+    return True
+
+
+def remux_with_fps(ffmpeg_exe: str, input_path: Path, output_path: Path, target_fps: float, tmpdir: Path) -> bool:
+    """Remux video with correct FPS using two-step H264 bitstream extraction method.
+
+    This method properly sets the output FPS by:
+    1. Extracting video to raw H264 bitstream
+    2. Remuxing with the new framerate
+    """
+    log(f"[fps] Setting output FPS to {target_fps:.3f}...")
+
+    # Step 1: Extract video to raw H264 bitstream
+    h264_path = tmpdir / "temp_bitstream.h264"
+
+    cmd_extract = [
+        ffmpeg_exe,
+        "-y",
+        "-i", str(input_path),
+        "-c", "copy",
+        "-an",  # Remove audio for bitstream extraction
+        "-f", "h264",
+        str(h264_path)
+    ]
+
+    log(f"[fps] Step 1: Extracting H264 bitstream...")
+    p = subprocess.run(cmd_extract, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        log(f"  ERROR: H264 extraction failed:\n{p.stderr}")
+        return False
+
+    # Step 2: Remux with new framerate
+    video_only_path = tmpdir / "temp_video_only.mp4"
+
+    cmd_remux = [
+        ffmpeg_exe,
+        "-y",
+        "-r", str(target_fps),
+        "-i", str(h264_path),
+        "-c", "copy",
+        str(video_only_path)
+    ]
+
+    log(f"[fps] Step 2: Remuxing with FPS={target_fps:.3f}...")
+    p = subprocess.run(cmd_remux, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if p.returncode != 0:
+        log(f"  ERROR: Remuxing failed:\n{p.stderr}")
+        try:
+            h264_path.unlink()
+        except OSError:
+            pass
+        return False
+
+    try:
+        h264_path.unlink()
+    except OSError:
+        pass
+
+    # Step 3: Merge video with audio from original file
+    log(f"[fps] Step 3: Merging audio from original...")
+    cmd_merge = [
+        ffmpeg_exe,
+        "-y",
+        "-i", str(video_only_path),
+        "-i", str(input_path),
+        "-c", "copy",
+        "-map", "0:v:0",      # Video from remuxed file
+        "-map", "1:a?",        # Audio from original (if exists)
+        str(output_path)
+    ]
+
+    p = subprocess.run(cmd_merge, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    try:
+        video_only_path.unlink()
+    except OSError:
+        pass
+
+    if p.returncode != 0:
+        log(f"  ERROR: Audio merge failed:\n{p.stderr}")
+        return False
+
+    log(f"[fps] ✓ Successfully set output FPS to {target_fps:.3f}")
+    return True
+
 # ---------------------------
-# Concatenation
+# Main concatenation
 # ---------------------------
 
-def concatenate_videos(ffmpeg_exe: str, ffprobe_exe: str, video_files: List[Path], output_path: Path) -> None:
-    """Concatenate all video files into one output file."""
+def concatenate_videos(
+    ffmpeg_exe: str,
+    ffprobe_exe: str,
+    video_files: List[Path],
+    output_path: Path,
+    shuffle: bool = False,
+    match_seams: bool = False,
+    seed: Optional[int] = None,
+    haystack_duration: float = 1.0,
+    haystack_skip: float = 0.0,
+    output_fps: Optional[float] = None,
+) -> None:
+    """Concatenate video files into one output file.
+
+    Args:
+        video_files: List of video files (already sorted alphabetically by find_video_files).
+        shuffle: If True, shuffle files into a random order before concatenating.
+        match_seams: If True, find best matching start frame for each successive clip.
+        seed: Random seed for reproducible shuffling (used only when shuffle=True).
+        haystack_duration: Seconds to search for best matching frame (used with match_seams).
+        haystack_skip: Seconds to skip at the start of each clip before searching (used with match_seams).
+        output_fps: If set, remux output to this framerate using H264 bitstream method.
+    """
     if not video_files:
         raise ValueError("No video files found to concatenate")
-    
-    log(f"\n[concat] Found {len(video_files)} video files")
-    
+
+    if match_seams and not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --match-seams. Install with: pip install opencv-python")
+
+    if match_seams and haystack_duration <= 0:
+        raise ValueError("haystack_duration must be positive")
+
+    # Determine clip order
+    ordered_files = video_files.copy()
+    if shuffle:
+        if seed is not None:
+            random.seed(seed)
+        random.shuffle(ordered_files)
+        log(f"\n[shuffle] Shuffled {len(ordered_files)} video files")
+    else:
+        log(f"\n[order] Processing {len(ordered_files)} video files in alphabetical order")
+    for i, f in enumerate(ordered_files):
+        log(f"  {i+1}. {f.name}")
+
     # Get specs from first file
-    log(f"[concat] Detecting specs from first file: {video_files[0].name}")
-    target_specs = get_video_specs(ffprobe_exe, video_files[0])
-    log(f"[concat] Target specs: {target_specs['width']}x{target_specs['height']} @ {target_specs['fps']:.2f} fps, codec={target_specs['codec']}")
-    
+    log(f"\n[specs] Detecting specs from first file: {ordered_files[0].name}")
+    target_specs = get_video_specs(ffprobe_exe, ordered_files[0])
+    log(f"[specs] Target specs: {target_specs['width']}x{target_specs['height']} @ {target_specs['fps']:.2f} fps, codec={target_specs['codec']}")
+
     # Create temp directory for intermediate files
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir_path = Path(tmpdir)
         concat_list_path = tmpdir_path / "concat_list.txt"
-        
-        # Process each video file
+
         processed_files = []
-        for i, video_file in enumerate(video_files):
-            log(f"\n[{i+1}/{len(video_files)}] Processing {video_file.name}")
-            
-            # Check specs
+        prev_last_frames = None  # Tuple of (second_to_last_frame, last_frame) for motion-aware matching
+
+        for i, video_file in enumerate(ordered_files):
+            log(f"\n[{i+1}/{len(ordered_files)}] Processing {video_file.name}")
+
+            # Get specs for this file
             try:
                 file_specs = get_video_specs(ffprobe_exe, video_file)
             except Exception as e:
                 log(f"  WARNING: Could not get specs, skipping: {e}")
                 continue
-            
-            # If specs match, use original file
-            if specs_match(target_specs, file_specs):
-                log(f"  Specs match, using original file")
-                processed_files.append(video_file)
-            else:
-                # Re-encode to match target specs
+
+            # Determine trim start time
+            trim_start = 0.0
+
+            if match_seams and i > 0 and prev_last_frames is not None:
+                # Find best matching frame pair in haystack (motion-aware matching)
+                log(f"  Finding best seam match (skip={haystack_skip:.2f}s, haystack={haystack_duration:.2f}s, 2-frame motion matching)...")
+
+                trim_start, mse = find_best_matching_frame_pair(
+                    ffmpeg_exe,
+                    prev_last_frames,
+                    video_file,
+                    haystack_duration,
+                    file_specs["fps"],
+                    tmpdir_path,
+                    haystack_skip
+                )
+
+                # Trim +1 additional frame from the beginning of the successive clip
+                extra_frames = 1
+                trim_start += extra_frames / file_specs["fps"]
+
+                log(f"  Best match at {trim_start:.3f}s (combined MSE={mse:.2f}, +{extra_frames} frames)")
+            elif match_seams and i > 0:
+                # Successive clip but prev_last_frames is None - frame extraction failed for previous clip
+                log(f"  WARNING: Skipping seam matching (no reference frames from previous clip)")
+
+            # Determine output file path
+            temp_output = tmpdir_path / f"processed_{i:04d}.mp4"
+
+            # Check if we need to re-encode or can stream copy
+            needs_reencode = not specs_match(target_specs, file_specs)
+
+            if needs_reencode:
                 log(f"  Specs differ: {file_specs['width']}x{file_specs['height']} @ {file_specs['fps']:.2f} fps")
-                temp_output = tmpdir_path / f"reencoded_{i:04d}.mp4"
-                if reencode_video(ffmpeg_exe, video_file, temp_output, target_specs):
+                if reencode_video(ffmpeg_exe, video_file, temp_output, target_specs, trim_start):
                     processed_files.append(temp_output)
                 else:
                     log(f"  WARNING: Skipping file due to re-encoding failure")
-        
+                    continue
+            elif trim_start > 0:
+                # Need to trim — re-encode for frame-accurate cut.
+                # Stream copy can only cut at keyframes, which defeats seam matching.
+                if trim_video_reencode(ffmpeg_exe, video_file, temp_output, trim_start, target_specs):
+                    processed_files.append(temp_output)
+                else:
+                    log(f"  WARNING: Frame-accurate trim failed, falling back to stream copy")
+                    if trim_video_streamcopy(ffmpeg_exe, video_file, temp_output, trim_start):
+                        processed_files.append(temp_output)
+                    else:
+                        log(f"  WARNING: Skipping file due to trimming failure")
+                        continue
+            else:
+                # No trimming needed, specs match
+                if match_seams and len(ordered_files) > 1:
+                    # Re-encode for consistent codec parameters with trimmed clips.
+                    # Without this, the concat demuxer (-c copy) mixes the original
+                    # encoding (which may use B-frames, different SPS/PPS) with
+                    # re-encoded trimmed clips, producing broken output.
+                    log(f"  Re-encoding for codec consistency (no trimming, lossless)...")
+                    if trim_video_reencode(ffmpeg_exe, video_file, temp_output, 0.0, target_specs):
+                        processed_files.append(temp_output)
+                    else:
+                        log(f"  WARNING: Re-encoding for consistency failed, using original file")
+                        processed_files.append(video_file)
+                else:
+                    log(f"  Specs match, using original file")
+                    processed_files.append(video_file)
+
+            # Get the last two frames of this processed file for the next iteration.
+            # Using 2 consecutive frames enables motion-aware seam matching.
+            if match_seams:
+                processed_file = processed_files[-1]
+                prev_last_frames = get_last_two_frames(ffmpeg_exe, ffprobe_exe, processed_file, tmpdir_path)
+
+                if prev_last_frames is None:
+                    log(f"  WARNING: Could not extract last two frames for motion-aware seam matching")
+
         if not processed_files:
             raise ValueError("No video files could be processed successfully")
-        
-        log(f"\n[concat] Successfully processed {len(processed_files)}/{len(video_files)} files")
-        
+
+        log(f"\n[concat] Successfully processed {len(processed_files)}/{len(ordered_files)} files")
+
         # Create concat list file
         log(f"[concat] Creating concat list...")
         with open(concat_list_path, "w", encoding="utf-8") as f:
             for video_file in processed_files:
                 # FFmpeg concat demuxer requires absolute paths or proper escaping
-                # Use absolute paths to avoid issues
                 abs_path = video_file.resolve()
                 # Escape single quotes in path
                 escaped = str(abs_path).replace("'", "'\\''")
                 f.write(f"file '{escaped}'\n")
-        
+
         # Concatenate using concat demuxer
         log(f"[concat] Concatenating {len(processed_files)} files into {output_path}")
         cmd = [
@@ -264,16 +852,35 @@ def concatenate_videos(ffmpeg_exe: str, ffprobe_exe: str, video_files: List[Path
             "-safe", "0",
             "-i", str(concat_list_path),
             "-c", "copy",
+            "-movflags", "+faststart",
             "-y",
             str(output_path)
         ]
-        
+
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if p.returncode != 0:
             raise RuntimeError(f"Concatenation failed:\n{p.stderr}")
-        
+
+        log(f"\n[concat] ✓ Successfully created initial concatenation")
+
+        # Remux with correct FPS using the two-step H264 bitstream method (only if --fps specified)
+        if output_fps is not None:
+            log(f"\n[fps] Applying correct framerate to output...")
+            temp_concat_output = tmpdir_path / "concat_temp.mp4"
+
+            shutil.move(str(output_path), str(temp_concat_output))
+
+            if not remux_with_fps(ffmpeg_exe, temp_concat_output, output_path, output_fps, tmpdir_path):
+                shutil.move(str(temp_concat_output), str(output_path))
+                log(f"  WARNING: FPS remux failed, using original concatenated output")
+            else:
+                try:
+                    temp_concat_output.unlink()
+                except OSError:
+                    pass
+
         log(f"\n[concat] ✓ Successfully created {output_path}")
-        
+
         # Show output file info
         output_size_mb = output_path.stat().st_size / (1024 * 1024)
         log(f"[concat] Output size: {output_size_mb:.2f} MB")
@@ -284,66 +891,138 @@ def concatenate_videos(ffmpeg_exe: str, ffprobe_exe: str, video_files: List[Path
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Concatenate all video clips recursively into one file",
+        description="Concatenate all video clips into one file",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
+  # Basic alphabetical concatenation
   python concat_clips.py /path/to/videos output.mp4
   python concat_clips.py /path/to/videos output.mp4 --no-recursive
-  python concat_clips.py /path/to/videos output.mp4 --ffmpeg /custom/path/ffmpeg
+
+  # Shuffle clips randomly before concatenating
+  python concat_clips.py /path/to/videos output.mp4 --shuffle
+  python concat_clips.py /path/to/videos output.mp4 --shuffle --seed 42
+
+  # Match seams between clips for smoother transitions
+  python concat_clips.py /path/to/videos output.mp4 --match-seams
+  python concat_clips.py /path/to/videos output.mp4 --match-seams --haystack-duration 2.0
+
+  # Shuffle and match seams together
+  python concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams --seed 42
+
+  # Automatic output naming from folder
+  python concat_clips.py --folder /path/to/videos
+  python concat_clips.py --folder /path/to/videos --shuffle --match-seams
         """
     )
-    
-    ap.add_argument("input_dir", type=str, help="Directory containing video files to concatenate")
-    ap.add_argument("output_file", type=str, help="Output file path (e.g., output.mp4)")
-    ap.add_argument("--no-recursive", action="store_true", help="Don't search subdirectories")
+
+    ap.add_argument("input_dir", type=str, nargs='?', default=None,
+                    help="Directory containing video files to concatenate")
+    ap.add_argument("output_file", type=str, nargs='?', default=None,
+                    help="Output file path (e.g., output.mp4)")
+    ap.add_argument("--folder", type=str, default=None,
+                    help="Input folder; output saved as <folder>.mp4")
+    ap.add_argument("--no-recursive", action="store_true",
+                    help="Don't search subdirectories (default: recursive)")
+    ap.add_argument("--shuffle", action="store_true",
+                    help="Shuffle clips into a random order (default: alphabetical)")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="Random seed for reproducible shuffling (used with --shuffle)")
+    ap.add_argument("--match-seams", action="store_true",
+                    help="Match seams between clips using motion-aware frame comparison (requires OpenCV)")
+    ap.add_argument("--haystack-duration", type=float, default=1.0,
+                    help="Seconds to search for best matching frame (used with --match-seams, default: 1.0)")
+    ap.add_argument("--haystack-skip", type=float, default=0.0,
+                    help="Seconds to skip at start of each clip before searching (used with --match-seams, default: 0.0)")
+    ap.add_argument("--fps", type=float, default=None,
+                    help="Output framerate (uses H264 bitstream remux method to set FPS)")
     ap.add_argument("--ffmpeg", type=str, default=None, help="Path to ffmpeg executable")
     ap.add_argument("--ffprobe", type=str, default=None, help="Path to ffprobe executable")
-    
+
     args = ap.parse_args()
-    
+
+    # Check OpenCV availability (only required when --match-seams is used)
+    if args.match_seams and not HAS_OPENCV:
+        log("ERROR: OpenCV is required for --match-seams.")
+        log("Install with: pip install opencv-python")
+        sys.exit(1)
+
+    # Validate haystack options
+    if args.haystack_duration <= 0:
+        log("ERROR: --haystack-duration must be a positive value")
+        sys.exit(1)
+    if args.haystack_skip < 0:
+        log("ERROR: --haystack-skip must be non-negative")
+        sys.exit(1)
+
+    # Determine input/output paths
+    if args.folder:
+        if args.input_dir or args.output_file:
+            log("ERROR: Cannot use --folder with positional arguments input_dir and output_file")
+            sys.exit(1)
+        folder_path = Path(args.folder).expanduser()
+        input_dir = folder_path
+        output_file = folder_path.parent / (folder_path.name + ".mp4")
+    else:
+        if not args.input_dir or not args.output_file:
+            log("ERROR: Either provide both input_dir and output_file, or use --folder")
+            sys.exit(1)
+        input_dir = Path(args.input_dir).expanduser()
+        output_file = Path(args.output_file).expanduser()
+
     # Validate input directory
-    input_dir = Path(args.input_dir)
     if not input_dir.exists():
         log(f"ERROR: Input directory does not exist: {input_dir}")
         sys.exit(1)
     if not input_dir.is_dir():
         log(f"ERROR: Input path is not a directory: {input_dir}")
         sys.exit(1)
-    
+
     # Validate output file
-    output_file = Path(args.output_file)
     if output_file.exists():
         log(f"WARNING: Output file already exists and will be overwritten: {output_file}")
-    
+
     # Ensure output directory exists
     output_file.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Find ffmpeg/ffprobe
     try:
         ffmpeg_exe, ffprobe_exe = require_ffmpeg(args.ffmpeg, args.ffprobe)
     except Exception as e:
         log(f"ERROR: {e}")
         sys.exit(1)
-    
-    # Find video files
+
+    # Find video files (sorted alphabetically)
     recursive = not args.no_recursive
     log(f"\n[scan] Scanning {input_dir} (recursive={recursive})")
     video_files = find_video_files(input_dir, recursive=recursive)
-    
+
     if not video_files:
         log(f"ERROR: No video files found in {input_dir}")
         sys.exit(1)
-    
+
+    log(f"[scan] Found {len(video_files)} video files")
+
     # Concatenate videos
     try:
-        concatenate_videos(ffmpeg_exe, ffprobe_exe, video_files, output_file)
+        concatenate_videos(
+            ffmpeg_exe,
+            ffprobe_exe,
+            video_files,
+            output_file,
+            shuffle=args.shuffle,
+            match_seams=args.match_seams,
+            seed=args.seed,
+            haystack_duration=args.haystack_duration,
+            haystack_skip=args.haystack_skip,
+            output_fps=args.fps,
+        )
     except Exception as e:
         log(f"\nERROR: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-    
+
     log("\n[done] ✓ Concatenation complete!")
 
 if __name__ == "__main__":
