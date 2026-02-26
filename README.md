@@ -11,7 +11,6 @@ A collection of free, open-source command-line video utilities for processing, c
 - [Requirements](#requirements)
 - [motion\_cctv — Motion-Only Clip Extraction](#motion_cctv--motion-only-clip-extraction)
 - [concat\_clips — Concatenate Video Clips](#concat_clips--concatenate-video-clips)
-- [shuffle\_concat\_seam — Shuffle & Concatenate with Seam Matching](#shuffle_concat_seam--shuffle--concatenate-with-seam-matching)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -176,66 +175,6 @@ Requires example footage in `example_footage/`. The test is skipped when footage
 
 ---
 
-## shuffle\_concat\_seam — Shuffle & Concatenate with Seam Matching
-
-**Location:** [`shuffle_concat_seam/`](shuffle_concat_seam/)
-
-> **Note:** The functionality of this utility has been merged into [`concat_clips`](#concat_clips--concatenate-video-clips).
-> Use `concat_clips --shuffle --match-seams` for the equivalent behaviour.
-
-Shuffle video clips into a random order and concatenate them with **motion-aware seam frame matching** for smoother transitions.
-
-### The Problem
-
-When concatenating clips that are "almost loops", simple joining produces visible jumps at each boundary. Matching a single still frame can also cause sudden-reversal-motion seams in clips with repetitive back-and-forth motion.
-
-### The Solution
-
-1. Extract the last **2 consecutive frames** of the preceding clip ("needle pair").
-2. Sample pairs of consecutive frames in the first N seconds of the next clip ("haystack").
-3. Pick the pair with the lowest combined MSE — this captures **motion direction** and prevents sudden reversals.
-
-### Basic Usage
-
-```bash
-python shuffle_concat_seam/shuffle_concat_seam.py /path/to/videos output.mp4
-```
-
-Automatic output naming:
-
-```bash
-python shuffle_concat_seam/shuffle_concat_seam.py --folder /path/to/videos
-# → /path/to/videos.mp4
-```
-
-### Command Line Options
-
-| Option | Description |
-|--------|-------------|
-| `--folder` | Input folder; output saved as `<folder>.mp4` |
-| `--haystack-duration` | Seconds to search for best match (default: 1.0) |
-| `--seed` | Random seed for reproducible ordering |
-| `--recursive` | Search subdirectories |
-| `--fps` | Output framerate (H.264 bitstream remux) |
-| `--no-trim` | Skip seam matching; use full clips |
-| `--ffmpeg` / `--ffprobe` | Custom executable paths |
-
-### How It Works
-
-1. Reads all video files from the input directory.
-2. Shuffles into random order.
-3. For each successive clip, finds the best-matching start frame pair via combined MSE comparison (grayscale + Gaussian blur).
-4. Trims via stream copy (or re-encodes if specs differ).
-5. Concatenates into a single output file.
-
-### Tests
-
-```bash
-python -m unittest shuffle_concat_seam.test_shuffle_concat_seam -v
-```
-
----
-
 ## concat\_clips — Concatenate Video Clips
 
 **Location:** [`concat_clips/`](concat_clips/)
@@ -300,6 +239,7 @@ python concat_clips/concat_clips.py --folder /path/to/videos
 
 ```bash
 python -m unittest concat_clips.test_concat_clips -v
+python -m unittest concat_clips.test_concat_seams -v
 ```
 
 ---
