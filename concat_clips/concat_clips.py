@@ -571,6 +571,25 @@ def extract_haystack_frames(
     return frames
 
 
+def _centroid_displacement(diff: Any) -> Any:
+    """Compute a 2-D motion-direction vector from a frame-difference array.
+
+    The displacement is defined as the centroid of appearing pixels (diff > 0)
+    minus the centroid of disappearing pixels (diff < 0).  This correctly
+    encodes the direction an object moved between two frames regardless of its
+    visual appearance, and avoids the failure mode of pixel-level cosine
+    similarity where consecutive diffs are spatially disjoint and always yield
+    a negative (or zero) dot product even for same-direction motion.
+
+    Returns a zero vector when there is no detectable motion.
+    """
+    pos_indices = np.argwhere(diff > 0)
+    neg_indices = np.argwhere(diff < 0)
+    if len(pos_indices) == 0 or len(neg_indices) == 0:
+        return np.zeros(2)
+    return pos_indices.mean(axis=0) - neg_indices.mean(axis=0)
+
+
 def find_best_seam(
     preceding_frames: List[Tuple[float, Any]],
     successor_frames: List[Tuple[float, Any]],
@@ -587,10 +606,15 @@ def find_best_seam(
 
     The scoring formula is::
 
-        score = similarity / (velocity_bonus * direction_bonus)
+        score = (similarity + 1.0) / (velocity_bonus * direction_bonus)
 
     where ``velocity_bonus = 1 + velocity / 30`` and
     ``direction_bonus = 1 + 0.5 * max(0, direction_cosine)``.
+    Motion direction is computed via centroid displacement (centroid of appearing
+    pixels minus centroid of disappearing pixels), which reliably encodes the
+    direction an object moved even when consecutive frame diffs are spatially
+    disjoint.  Adding 1.0 to similarity ensures velocity and direction still
+    differentiate candidates when junction frames are identical (MSE = 0).
     A lower score is better.
 
     Args:
@@ -623,22 +647,26 @@ def find_best_seam(
         a_curr_time, a_curr = preceding_frames[i + 1]
         diff_a = a_curr.astype(np.float64) - a_prev.astype(np.float64)
         vel_a = float(np.mean(np.abs(diff_a)))
+        motion_a = _centroid_displacement(diff_a)
 
         for j in range(len(successor_frames) - 1):
             b_curr_time, b_curr = successor_frames[j]
             b_next_time, b_next = successor_frames[j + 1]
             diff_b = b_next.astype(np.float64) - b_curr.astype(np.float64)
             vel_b = float(np.mean(np.abs(diff_b)))
+            motion_b = _centroid_displacement(diff_b)
 
             # Primary criterion: similarity between junction frames.
             # a_curr is the last frame of A; b_curr is the matching frame in B.
             similarity = compute_frame_difference(a_curr, b_curr)
 
-            # Secondary criterion: motion direction match (cosine similarity).
-            norm_a = float(np.sqrt(np.sum(diff_a ** 2)))
-            norm_b = float(np.sqrt(np.sum(diff_b ** 2)))
+            # Secondary criterion: motion direction match via centroid displacement.
+            # _centroid_displacement gives a 2-D vector pointing in the direction
+            # an object moved between two frames, regardless of its appearance.
+            norm_a = float(np.linalg.norm(motion_a))
+            norm_b = float(np.linalg.norm(motion_b))
             if norm_a > 1e-6 and norm_b > 1e-6:
-                direction = float(np.sum(diff_a * diff_b) / (norm_a * norm_b))
+                direction = float(np.dot(motion_a, motion_b) / (norm_a * norm_b))
             else:
                 direction = 0.0
 
@@ -646,9 +674,11 @@ def find_best_seam(
             velocity = (vel_a + vel_b) / 2.0
 
             # Combined score (lower = better).
+            # Adding 1.0 to similarity ensures velocity/direction still act as
+            # tiebreakers when junction frames are identical (MSE = 0).
             velocity_bonus = 1.0 + velocity / 30.0
             direction_bonus = 1.0 + 0.5 * max(0.0, direction)
-            score = similarity / (velocity_bonus * direction_bonus)
+            score = (similarity + 1.0) / (velocity_bonus * direction_bonus)
 
             if score < best_score:
                 best_score = score
