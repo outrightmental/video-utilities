@@ -28,6 +28,7 @@ if HAS_OPENCV:
     from concat_clips.concat_clips import (
         preprocess_frame_for_comparison,
         compute_frame_difference,
+        find_best_seam,
     )
 
 from concat_clips.concat_clips import (
@@ -230,19 +231,19 @@ class TestShuffleMode(unittest.TestCase):
             self.assertIn("OpenCV", str(ctx.exception))
 
     @patch('concat_clips.concat_clips.HAS_OPENCV', True)
-    @patch('concat_clips.concat_clips.find_best_matching_frame_pair')
-    @patch('concat_clips.concat_clips.get_last_two_frames')
+    @patch('concat_clips.concat_clips.find_best_seam')
+    @patch('concat_clips.concat_clips.extract_haystack_frames')
     @patch('concat_clips.concat_clips.trim_video_reencode')
     @patch('concat_clips.concat_clips.get_video_specs')
     def test_match_seams_calls_frame_matching(self, mock_get_specs, mock_reencode,
-                                              mock_get_last, mock_find_best):
+                                              mock_extract, mock_find_best):
         """Verify that match_seams=True calls frame matching for successive clips."""
         mock_get_specs.return_value = {
             'codec': 'h264', 'width': 1920, 'height': 1080,
             'fps': 30.0, 'duration': 10.0
         }
-        mock_get_last.return_value = (MagicMock(), MagicMock())
-        mock_find_best.return_value = (0.5, 100.0)
+        mock_extract.return_value = [(0.0, MagicMock()), (0.033, MagicMock())]
+        mock_find_best.return_value = (9.0, 0.5, 100.0)
         mock_reencode.return_value = True
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -266,19 +267,19 @@ class TestShuffleMode(unittest.TestCase):
             except (RuntimeError, subprocess.CalledProcessError, OSError):
                 pass
 
-            # Verify that get_last_two_frames was called (to extract frames for matching)
-            self.assertTrue(mock_get_last.called,
-                "get_last_two_frames should be called when match_seams=True")
+            # Verify that extract_haystack_frames was called (to extract frames for matching)
+            self.assertTrue(mock_extract.called,
+                "extract_haystack_frames should be called when match_seams=True")
 
-            # Verify that find_best_matching_frame_pair was called for the second clip
+            # Verify that find_best_seam was called for the adjacent clip pair
             self.assertTrue(mock_find_best.called,
-                "find_best_matching_frame_pair should be called for successive clips when match_seams=True")
+                "find_best_seam should be called for adjacent clip pairs when match_seams=True")
 
     @patch('concat_clips.concat_clips.HAS_OPENCV', True)
-    @patch('concat_clips.concat_clips.find_best_matching_frame_pair')
-    @patch('concat_clips.concat_clips.get_last_two_frames')
+    @patch('concat_clips.concat_clips.find_best_seam')
+    @patch('concat_clips.concat_clips.extract_haystack_frames')
     @patch('concat_clips.concat_clips.get_video_specs')
-    def test_no_match_seams_skips_frame_matching(self, mock_get_specs, mock_get_last, mock_find_best):
+    def test_no_match_seams_skips_frame_matching(self, mock_get_specs, mock_extract, mock_find_best):
         """Verify that match_seams=False skips frame matching."""
         mock_get_specs.return_value = {
             'codec': 'h264', 'width': 1920, 'height': 1080,
@@ -307,7 +308,72 @@ class TestShuffleMode(unittest.TestCase):
 
             # Verify frame matching was NOT called when match_seams=False
             mock_find_best.assert_not_called()
-            mock_get_last.assert_not_called()
+            mock_extract.assert_not_called()
+
+
+@unittest.skipUnless(HAS_OPENCV, "OpenCV is required for these tests")
+class TestFindBestSeam(unittest.TestCase):
+    """Test the find_best_seam function."""
+
+    def _make_frames(self, positions):
+        """Create a list of (timestamp, grayscale_frame) tuples for testing.
+
+        Each 'position' is an x-offset for a white square in a black 100×100 frame.
+        """
+        frames = []
+        for t, x in positions:
+            frame = np.zeros((100, 100), dtype=np.uint8)
+            frame[40:60, x:x + 20] = 255
+            frames.append((t, frame))
+        return frames
+
+    def test_returns_none_for_short_preceding_list(self):
+        """Returns (None, None, inf) when preceding list has fewer than 2 frames."""
+        preceding = self._make_frames([(0.0, 10)])  # Only 1 frame
+        successor = self._make_frames([(0.0, 10), (0.033, 30)])
+
+        pre_end, suc_start, score = find_best_seam(preceding, successor)
+
+        self.assertIsNone(pre_end)
+        self.assertIsNone(suc_start)
+        self.assertEqual(score, float('inf'))
+
+    def test_returns_none_for_short_successor_list(self):
+        """Returns (None, None, inf) when successor list has fewer than 2 frames."""
+        preceding = self._make_frames([(0.0, 10), (0.033, 30)])
+        successor = self._make_frames([(0.0, 10)])  # Only 1 frame
+
+        pre_end, suc_start, score = find_best_seam(preceding, successor)
+
+        self.assertIsNone(pre_end)
+        self.assertIsNone(suc_start)
+        self.assertEqual(score, float('inf'))
+
+    def test_prefers_similar_junction_frames(self):
+        """The seam with the most similar junction frames wins."""
+        # Preceding has two candidate ending frames at x=10 and x=50.
+        # Successor head starts at x=10 (matches first ending candidate).
+        preceding = self._make_frames([(8.0, 30), (8.033, 10)])   # pair: ending at x=10
+        successor = self._make_frames([(0.0, 10), (0.033, 30)])   # starts at x=10
+
+        pre_end, suc_start, score = find_best_seam(preceding, successor)
+
+        self.assertIsNotNone(pre_end)
+        self.assertIsNotNone(suc_start)
+        # The best junction is where a_curr (x=10) matches b_curr (x=10), so pre_end = 8.033
+        self.assertAlmostEqual(pre_end, 8.033, places=2)
+
+    def test_trim_end_is_a_curr_and_start_is_b_next(self):
+        """trim_end is the time of a_curr; trim_start is the time of b_next (not b_curr)."""
+        preceding = self._make_frames([(8.0, 30), (8.033, 10)])
+        successor = self._make_frames([(0.0, 10), (0.033, 30)])
+
+        pre_end, suc_start, score = find_best_seam(preceding, successor)
+
+        # The junction is a_curr (t=8.033) ≈ b_curr (t=0.0).
+        # The first included successor frame is b_next (t=0.033).
+        self.assertAlmostEqual(pre_end, 8.033, places=2)
+        self.assertAlmostEqual(suc_start, 0.033, places=2)
 
 
 class TestDocumentation(unittest.TestCase):
@@ -328,10 +394,10 @@ class TestDocumentation(unittest.TestCase):
         from concat_clips.concat_clips import __doc__ as module_doc
         self.assertIn("alphabetical", module_doc.lower())
 
-    def test_module_mentions_needle_pair(self):
-        """Verify the seam matching algorithm description mentions needle pair."""
+    def test_module_mentions_velocity(self):
+        """Verify the seam matching algorithm description mentions velocity."""
         from concat_clips.concat_clips import __doc__ as module_doc
-        self.assertIn("needle pair", module_doc.lower())
+        self.assertIn("velocity", module_doc.lower())
 
 
 if __name__ == "__main__":
