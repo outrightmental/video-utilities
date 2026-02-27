@@ -243,7 +243,7 @@ class TestShuffleMode(unittest.TestCase):
             'fps': 30.0, 'duration': 10.0
         }
         mock_extract.return_value = [(0.0, MagicMock()), (0.033, MagicMock())]
-        mock_find_best.return_value = (9.0, 0.5, 100.0)
+        mock_find_best.return_value = (9.0, 0.5, 100.0)  # (trim_end_preceding, trim_start_successor, score)
         mock_reencode.return_value = True
 
         with tempfile.TemporaryDirectory() as tmpdir:
