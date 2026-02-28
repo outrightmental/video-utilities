@@ -20,13 +20,20 @@ Features:
 - Handles various video formats (mp4, avi, mkv, mov, etc.)
 
 Seam Matching Algorithm (--match-seams):
-1. Get the last 2 consecutive frames of the preceding clip ("needle pair").
-2. Examine frame pairs in the first N seconds of the successive clip ("haystack").
-3. Compare each pair of consecutive haystack frames to the needle pair using
-   combined pixel difference (sum of MSE for both frame comparisons).
-4. Select the first frame of the pair with minimum combined difference as the
-   trim start point.
-5. Concatenate all clips with the determined trim points.
+1. For each adjacent pair of clips (A, B), extract frames from:
+   - The last N seconds of clip A ("preceding haystack").
+   - The first N seconds of clip B ("successor haystack").
+2. Compare every consecutive pair from the preceding haystack against every
+   consecutive pair from the successor haystack using a combined score that
+   rewards: (a) high frame similarity at the junction, (b) motion in the same
+   direction across the seam, and (c) the highest possible velocity (fast
+   motion hides seam artefacts — the magician's sleight of hand).
+3. The best-scoring combination determines:
+   - trim_end  for clip A (its last included frame).
+   - trim_start for clip B (one frame after the matching frame, avoiding a
+     duplicate of the junction frame).
+4. All clips are then re-encoded with their determined trim points and
+   concatenated.
 
 Requires:
 - ffmpeg + ffprobe (on PATH or pass --ffmpeg/--ffprobe)
@@ -498,18 +505,204 @@ def _find_best_matching_frame_pair_individual(
 
     return best_time, best_mse
 
-# ---------------------------
-# Video re-encoding and trimming
-# ---------------------------
 
-def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_specs: dict, start_time: float = 0.0) -> bool:
-    """Re-encode video to match target specs, optionally starting from a specific time."""
-    log(f"  Re-encoding {input_path.name} (start={start_time:.3f}s)...")
+def extract_haystack_frames(
+    ffmpeg_exe: str,
+    video_path: Path,
+    start_time: float,
+    duration: float,
+    fps: float,
+    tmpdir: Path,
+) -> List[Tuple[float, Any]]:
+    """Extract preprocessed frames from a video segment for seam analysis.
+
+    Args:
+        ffmpeg_exe: Path to ffmpeg executable.
+        video_path: Path to the video file.
+        start_time: Start time in seconds within the original file.
+        duration: Duration in seconds of the segment to extract.
+        fps: Frames per second to use for extraction.
+        tmpdir: Temporary directory for intermediate frame files.
+
+    Returns:
+        List of (timestamp_in_original_file, preprocessed_frame) tuples sorted
+        by timestamp. Returns an empty list if extraction fails.
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for frame comparison. Install with: pip install opencv-python")
+
+    effective_fps = fps if fps > 0 else 30.0
+    frame_interval = 1.0 / effective_fps
+
+    # Use a unique subdirectory to avoid conflicts across concurrent calls
+    batch_dir = tmpdir / f"haystack_{video_path.stem}_{int(start_time * 1000)}"
+    batch_dir.mkdir(exist_ok=True)
+
+    frames: List[Tuple[float, Any]] = []
+
+    try:
+        cmd = [
+            ffmpeg_exe,
+            "-ss", str(start_time),
+            "-i", str(video_path),
+            "-t", str(duration),
+            "-vf", f"fps={effective_fps}",
+            "-y",
+            str(batch_dir / "frame_%04d.png"),
+        ]
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if p.returncode != 0:
+            log(f"  WARNING: Haystack frame extraction failed for {video_path.name}")
+            return frames
+
+        for idx, frame_path in enumerate(sorted(batch_dir.glob("frame_*.png"))):
+            frame = cv2.imread(str(frame_path))
+            if frame is not None:
+                timestamp = start_time + idx * frame_interval
+                frames.append((timestamp, preprocess_frame_for_comparison(frame)))
+    finally:
+        try:
+            for f in batch_dir.glob("*.png"):
+                f.unlink()
+            batch_dir.rmdir()
+        except OSError:
+            pass
+
+    return frames
+
+
+def _centroid_displacement(diff: Any) -> Any:
+    """Compute a 2-D motion-direction vector from a frame-difference array.
+
+    The displacement is defined as the centroid of appearing pixels (diff > 0)
+    minus the centroid of disappearing pixels (diff < 0).  This correctly
+    encodes the direction an object moved between two frames regardless of its
+    visual appearance, and avoids the failure mode of pixel-level cosine
+    similarity where consecutive diffs are spatially disjoint and always yield
+    a negative (or zero) dot product even for same-direction motion.
+
+    Returns a zero vector when there is no detectable motion.
+    """
+    pos_indices = np.argwhere(diff > 0)
+    neg_indices = np.argwhere(diff < 0)
+    if len(pos_indices) == 0 or len(neg_indices) == 0:
+        return np.zeros(2)
+    return pos_indices.mean(axis=0) - neg_indices.mean(axis=0)
+
+
+def find_best_seam(
+    preceding_frames: List[Tuple[float, Any]],
+    successor_frames: List[Tuple[float, Any]],
+) -> Tuple[Optional[float], Optional[float], float]:
+    """Find the best seam between the tail of a preceding clip and the head of a successor clip.
+
+    Simultaneously searches both frame lists to find the (preceding_end,
+    successor_start) combination that maximises seam quality according to three
+    criteria, in descending order of importance:
+
+    1. **Similarity** – the junction frames look as alike as possible (low MSE).
+    2. **Direction** – motion across the seam continues in the same direction.
+    3. **Velocity** – the seam occurs during fast motion so artefacts are hidden.
+
+    The scoring formula is::
+
+        score = (similarity + 1.0) / (velocity_bonus * direction_bonus)
+
+    where ``velocity_bonus = 1 + velocity / 30`` and
+    ``direction_bonus = 1 + 0.5 * max(0, direction_cosine)``.
+    Motion direction is computed via centroid displacement (centroid of appearing
+    pixels minus centroid of disappearing pixels), which reliably encodes the
+    direction an object moved even when consecutive frame diffs are spatially
+    disjoint.  Adding 1.0 to similarity ensures velocity and direction still
+    differentiate candidates when junction frames are identical (MSE = 0).
+    A lower score is better.
+
+    Args:
+        preceding_frames: List of (time, preprocessed_frame) from the END of the
+            preceding clip (at least 2 frames required).
+        successor_frames: List of (time, preprocessed_frame) from the START of the
+            successor clip (at least 2 frames required).
+
+    Returns:
+        Tuple of (trim_end_preceding, trim_start_successor, best_score) where:
+        - *trim_end_preceding*: timestamp of the **last frame to include** from
+          the preceding clip.
+        - *trim_start_successor*: timestamp of the **first frame to include**
+          from the successor clip (one frame after the matching junction frame,
+          to avoid a near-duplicate at the seam).
+        - *best_score*: score of the winning pair (lower = better).
+
+        Returns ``(None, None, inf)`` when fewer than 2 frames are available in
+        either list.
+    """
+    if len(preceding_frames) < 2 or len(successor_frames) < 2:
+        return None, None, float('inf')
+
+    best_score = float('inf')
+    best_pre_time: Optional[float] = None
+    best_suc_time: Optional[float] = None
+
+    for i in range(len(preceding_frames) - 1):
+        a_prev_time, a_prev = preceding_frames[i]
+        a_curr_time, a_curr = preceding_frames[i + 1]
+        diff_a = a_curr.astype(np.float64) - a_prev.astype(np.float64)
+        vel_a = float(np.mean(np.abs(diff_a)))
+        motion_a = _centroid_displacement(diff_a)
+
+        for j in range(len(successor_frames) - 1):
+            b_curr_time, b_curr = successor_frames[j]
+            b_next_time, b_next = successor_frames[j + 1]
+            diff_b = b_next.astype(np.float64) - b_curr.astype(np.float64)
+            vel_b = float(np.mean(np.abs(diff_b)))
+            motion_b = _centroid_displacement(diff_b)
+
+            # Primary criterion: similarity between junction frames.
+            # a_curr is the last frame of A; b_curr is the matching frame in B.
+            similarity = compute_frame_difference(a_curr, b_curr)
+
+            # Secondary criterion: motion direction match via centroid displacement.
+            # _centroid_displacement gives a 2-D vector pointing in the direction
+            # an object moved between two frames, regardless of its appearance.
+            norm_a = float(np.linalg.norm(motion_a))
+            norm_b = float(np.linalg.norm(motion_b))
+            if norm_a > 1e-6 and norm_b > 1e-6:
+                direction = float(np.dot(motion_a, motion_b) / (norm_a * norm_b))
+            else:
+                direction = 0.0
+
+            # Tertiary criterion: velocity — fast motion hides seam artefacts.
+            velocity = (vel_a + vel_b) / 2.0
+
+            # Combined score (lower = better).
+            # Adding 1.0 to similarity ensures velocity/direction still act as
+            # tiebreakers when junction frames are identical (MSE = 0).
+            velocity_bonus = 1.0 + velocity / 30.0
+            direction_bonus = 1.0 + 0.5 * max(0.0, direction)
+            score = (similarity + 1.0) / (velocity_bonus * direction_bonus)
+
+            if score < best_score:
+                best_score = score
+                best_pre_time = a_curr_time
+                # The first frame of the successor clip is b_next (not b_curr),
+                # so that b_curr — which matches a_curr — is not repeated.
+                best_suc_time = b_next_time
+
+    return best_pre_time, best_suc_time, best_score
+
+
+def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_specs: dict, start_time: float = 0.0, end_time: Optional[float] = None) -> bool:
+    """Re-encode video to match target specs, optionally starting/ending at specific times."""
+    end_desc = f", end={end_time:.3f}s" if end_time is not None else ""
+    log(f"  Re-encoding {input_path.name} (start={start_time:.3f}s{end_desc})...")
 
     cmd = [
         ffmpeg_exe,
         "-ss", str(start_time),
         "-i", str(input_path),
+    ]
+    if end_time is not None:
+        cmd.extend(["-t", str(end_time - start_time)])
+    cmd.extend([
         "-c:v", "libx264",
         "-preset", "medium",
         "-crf", "23",
@@ -522,7 +715,7 @@ def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_
         "-movflags", "+faststart",
         "-y",
         str(output_path)
-    ]
+    ])
 
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
@@ -558,7 +751,7 @@ def trim_video_streamcopy(ffmpeg_exe: str, input_path: Path, output_path: Path, 
     return True
 
 
-def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict) -> bool:
+def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict, end_time: Optional[float] = None) -> bool:
     """Trim video with frame-accurate seeking by near-lossless re-encoding.
 
     Stream copy (-c copy) can only cut at keyframes, which means the actual cut
@@ -570,12 +763,17 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
     Media Foundation (Photos app).  CRF 0 is avoided because it forces the
     High 4:4:4 Predictive profile which Windows cannot decode.
     """
-    log(f"  Trimming {input_path.name} from {start_time:.3f}s (near-lossless re-encode for frame-accurate cut)...")
+    end_desc = f" to {end_time:.3f}s" if end_time is not None else ""
+    log(f"  Trimming {input_path.name} from {start_time:.3f}s{end_desc} (near-lossless re-encode for frame-accurate cut)...")
 
     cmd = [
         ffmpeg_exe,
         "-ss", str(start_time),
         "-i", str(input_path),
+    ]
+    if end_time is not None:
+        cmd.extend(["-t", str(end_time - start_time)])
+    cmd.extend([
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "1",
@@ -588,7 +786,7 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
         "-movflags", "+faststart",
         "-y",
         str(output_path)
-    ]
+    ])
 
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
@@ -702,10 +900,13 @@ def concatenate_videos(
     Args:
         video_files: List of video files (already sorted alphabetically by find_video_files).
         shuffle: If True, shuffle files into a random order before concatenating.
-        match_seams: If True, find best matching start frame for each successive clip.
+        match_seams: If True, find best matching seam for each pair of adjacent clips by
+            simultaneously searching the tail of the preceding clip and the head of the
+            successive clip — trimming BOTH the end of the preceding clip and the start
+            of the successive clip at the optimal joint.
         seed: Random seed for reproducible shuffling (used only when shuffle=True).
-        haystack_duration: Seconds to search for best matching frame (used with match_seams).
-        haystack_skip: Seconds to skip at the start of each clip before searching (used with match_seams).
+        haystack_duration: Seconds to search at each end for the best seam (used with match_seams).
+        haystack_skip: Seconds to skip at the start of each successive clip before searching (used with match_seams).
         output_fps: If set, remux output to this framerate using H264 bitstream method.
     """
     if not video_files:
@@ -739,62 +940,102 @@ def concatenate_videos(
         tmpdir_path = Path(tmpdir)
         concat_list_path = tmpdir_path / "concat_list.txt"
 
-        processed_files = []
-        prev_last_frames = None  # Tuple of (second_to_last_frame, last_frame) for motion-aware matching
+        # ------------------------------------------------------------------
+        # Phase 1: Gather specs for all clips and determine seam trim points.
+        # ------------------------------------------------------------------
 
-        for i, video_file in enumerate(ordered_files):
-            log(f"\n[{i+1}/{len(ordered_files)}] Processing {video_file.name}")
-
-            # Get specs for this file
+        # Collect specs up-front so Phase 2 can reference them without extra
+        # ffprobe calls.
+        all_specs: List[Optional[dict]] = []
+        for video_file in ordered_files:
             try:
-                file_specs = get_video_specs(ffprobe_exe, video_file)
+                all_specs.append(get_video_specs(ffprobe_exe, video_file))
             except Exception as e:
-                log(f"  WARNING: Could not get specs, skipping: {e}")
-                continue
+                log(f"  WARNING: Could not get specs for {video_file.name}: {e}")
+                all_specs.append(None)
 
-            # Determine trim start time
-            trim_start = 0.0
+        N = len(ordered_files)
+        trim_starts: List[float] = [0.0] * N
+        trim_ends: List[Optional[float]] = [None] * N  # None → encode to end of clip
 
-            if match_seams and i > 0 and prev_last_frames is not None:
-                # Find best matching frame pair in haystack (motion-aware matching)
-                log(f"  Finding best seam match (skip={haystack_skip:.2f}s, haystack={haystack_duration:.2f}s, 2-frame motion matching)...")
+        if match_seams and N > 1:
+            log(f"\n[seams] Finding seam trim points for {N - 1} adjacent pair(s)...")
 
-                trim_start, mse = find_best_matching_frame_pair(
-                    ffmpeg_exe,
-                    prev_last_frames,
-                    video_file,
-                    haystack_duration,
-                    file_specs["fps"],
-                    tmpdir_path,
-                    haystack_skip
+            for i in range(N - 1):
+                pre_specs = all_specs[i]
+                suc_specs = all_specs[i + 1]
+
+                if pre_specs is None or suc_specs is None:
+                    log(f"  Pair {i+1}/{N-1}: skipping (missing specs)")
+                    continue
+
+                pre_duration = pre_specs["duration"]
+                pre_fps = pre_specs["fps"]
+                suc_fps = suc_specs["fps"]
+
+                # Preceding clip haystack: the last haystack_duration seconds
+                # (but no earlier than trim_starts[i], which was set by the
+                # previous seam).
+                pre_start = max(trim_starts[i], pre_duration - haystack_duration)
+                pre_dur = pre_duration - pre_start
+
+                # Successor clip haystack: the first haystack_duration seconds
+                # after haystack_skip.
+                suc_start = haystack_skip
+                suc_dur = haystack_duration
+
+                log(f"  Pair {i+1}/{N-1}: '{ordered_files[i].name}' → '{ordered_files[i+1].name}'")
+                log(f"    Extracting preceding tail  [{pre_start:.2f}s – {pre_duration:.2f}s]...")
+                pre_frames = extract_haystack_frames(
+                    ffmpeg_exe, ordered_files[i], pre_start, pre_dur, pre_fps, tmpdir_path
                 )
 
-                # Trim +1 additional frame from the beginning of the successive clip
-                extra_frames = 1
-                trim_start += extra_frames / file_specs["fps"]
+                log(f"    Extracting successor head  [{suc_start:.2f}s – {suc_start + suc_dur:.2f}s]...")
+                suc_frames = extract_haystack_frames(
+                    ffmpeg_exe, ordered_files[i + 1], suc_start, suc_dur, suc_fps, tmpdir_path
+                )
 
-                log(f"  Best match at {trim_start:.3f}s (combined MSE={mse:.2f}, +{extra_frames} frames)")
-            elif match_seams and i > 0:
-                # Successive clip but prev_last_frames is None - frame extraction failed for previous clip
-                log(f"  WARNING: Skipping seam matching (no reference frames from previous clip)")
+                pre_end, suc_start_trim, score = find_best_seam(pre_frames, suc_frames)
 
-            # Determine output file path
+                if pre_end is not None and suc_start_trim is not None:
+                    trim_ends[i] = pre_end
+                    trim_starts[i + 1] = suc_start_trim
+                    log(f"    Best seam: preceding ends at {pre_end:.3f}s, "
+                        f"successor starts at {suc_start_trim:.3f}s (score={score:.4f})")
+                else:
+                    log(f"    WARNING: Could not determine seam for pair {i+1} — using defaults")
+
+        # ------------------------------------------------------------------
+        # Phase 2: Process every clip with its determined trim points.
+        # ------------------------------------------------------------------
+
+        processed_files = []
+
+        for i, video_file in enumerate(ordered_files):
+            log(f"\n[{i+1}/{N}] Processing {video_file.name}")
+
+            file_specs = all_specs[i]
+            if file_specs is None:
+                log(f"  WARNING: No specs available, skipping")
+                continue
+
+            trim_start = trim_starts[i]
+            trim_end = trim_ends[i]
+
             temp_output = tmpdir_path / f"processed_{i:04d}.mp4"
-
-            # Check if we need to re-encode or can stream copy
             needs_reencode = not specs_match(target_specs, file_specs)
 
             if needs_reencode:
                 log(f"  Specs differ: {file_specs['width']}x{file_specs['height']} @ {file_specs['fps']:.2f} fps")
-                if reencode_video(ffmpeg_exe, video_file, temp_output, target_specs, trim_start):
+                if reencode_video(ffmpeg_exe, video_file, temp_output, target_specs, trim_start, trim_end):
                     processed_files.append(temp_output)
                 else:
                     log(f"  WARNING: Skipping file due to re-encoding failure")
                     continue
-            elif trim_start > 0:
-                # Need to trim — re-encode for frame-accurate cut.
+            elif trim_start > 0 or trim_end is not None:
+                # Need to trim — re-encode for frame-accurate cuts.
                 # Stream copy can only cut at keyframes, which defeats seam matching.
-                if trim_video_reencode(ffmpeg_exe, video_file, temp_output, trim_start, target_specs):
+                if trim_video_reencode(ffmpeg_exe, video_file, temp_output, trim_start, target_specs, trim_end):
                     processed_files.append(temp_output)
                 else:
                     log(f"  WARNING: Frame-accurate trim failed, falling back to stream copy")
@@ -805,7 +1046,7 @@ def concatenate_videos(
                         continue
             else:
                 # No trimming needed, specs match
-                if match_seams and len(ordered_files) > 1:
+                if match_seams and N > 1:
                     # Re-encode for consistent codec parameters with trimmed clips.
                     # Without this, the concat demuxer (-c copy) mixes the original
                     # encoding (which may use B-frames, different SPS/PPS) with
@@ -819,15 +1060,6 @@ def concatenate_videos(
                 else:
                     log(f"  Specs match, using original file")
                     processed_files.append(video_file)
-
-            # Get the last two frames of this processed file for the next iteration.
-            # Using 2 consecutive frames enables motion-aware seam matching.
-            if match_seams:
-                processed_file = processed_files[-1]
-                prev_last_frames = get_last_two_frames(ffmpeg_exe, ffprobe_exe, processed_file, tmpdir_path)
-
-                if prev_last_frames is None:
-                    log(f"  WARNING: Could not extract last two frames for motion-aware seam matching")
 
         if not processed_files:
             raise ValueError("No video files could be processed successfully")

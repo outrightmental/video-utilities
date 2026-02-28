@@ -25,6 +25,7 @@ except ImportError:
 if HAS_OPENCV:
     from concat_clips.concat_clips import (
         compute_frame_difference,
+        find_best_seam,
     )
 
 
@@ -116,6 +117,68 @@ class TestMotionAwarePairMatching(unittest.TestCase):
 
         # Pair A should win because it matches the motion direction
         self.assertLess(mse_a, mse_b)
+
+
+@unittest.skipUnless(HAS_OPENCV, "OpenCV is required for these tests")
+class TestFindBestSeamScoring(unittest.TestCase):
+    """Test that find_best_seam correctly weights similarity, direction, and velocity."""
+
+    def _make_frames(self, positions):
+        """Create (timestamp, grayscale_frame) pairs with a white square at each x position."""
+        frames = []
+        for t, x in positions:
+            frame = np.zeros((100, 100), dtype=np.uint8)
+            frame[40:60, x:x + 20] = 255
+            frames.append((t, frame))
+        return frames
+
+    def test_prefers_same_direction_over_opposite(self):
+        """
+        find_best_seam should prefer a seam where motion continues in the same direction.
+
+        Both candidates have the same similarity score (identical junction frames),
+        but candidate A continues moving right while candidate B reverses to the left.
+        The seam with matching direction (A) should have a better (lower) score.
+        """
+        # Preceding clip tail: object moving right, ending at x=40.
+        # Pair: (x=20 → x=40) — rightward motion ending at the seam.
+        preceding = self._make_frames([(8.0, 20), (8.033, 40)])
+
+        # Successor candidate A: continues rightward (x=40 → x=60).
+        # b_curr (x=40) matches a_curr (x=40) perfectly.
+        successor_same_dir = self._make_frames([(0.0, 40), (0.033, 60)])
+
+        # Successor candidate B: reverses leftward (x=40 → x=20).
+        # b_curr (x=40) also matches a_curr (x=40) perfectly — same similarity.
+        successor_opp_dir = self._make_frames([(0.0, 40), (0.033, 20)])
+
+        _, _, score_same = find_best_seam(preceding, successor_same_dir)
+        _, _, score_opp = find_best_seam(preceding, successor_opp_dir)
+
+        self.assertLess(score_same, score_opp,
+            "Seam with same motion direction should have a better (lower) score")
+
+    def test_prefers_high_velocity_when_similarity_is_equal(self):
+        """
+        find_best_seam should prefer positions with faster motion when frames are equally similar.
+
+        Both candidates have the same similarity (identical junction frame content),
+        but candidate A has a high-velocity preceding pair while candidate B is nearly static.
+        The high-velocity seam (A) should have a better (lower) score.
+        """
+        # Two separate preceding clips: one with fast motion, one nearly still.
+        # Both end on the same frame (x=40), giving equal similarity.
+        preceding_fast = self._make_frames([(8.0, 10), (8.033, 40)])   # large displacement
+        preceding_slow = self._make_frames([(8.0, 39), (8.033, 40)])   # tiny displacement
+
+        # A shared successor: also moves rightward from x=40.
+        successor = self._make_frames([(0.0, 40), (0.033, 60)])
+
+        _, _, score_fast = find_best_seam(preceding_fast, successor)
+        _, _, score_slow = find_best_seam(preceding_slow, successor)
+
+        self.assertLess(score_fast, score_slow,
+            "Seam during fast motion should have a better (lower) score than a near-static seam")
 
 
 class TestConcatenationIntegrity(unittest.TestCase):
