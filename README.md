@@ -179,7 +179,7 @@ Requires example footage in `example_footage/`. The test is skipped when footage
 
 **Location:** [`concat_clips/`](concat_clips/)
 
-Concatenate all video files in a directory into a single output file. Clips are sorted **alphabetically by filename** by default. Optional flags choose a different ordering (`--shuffle`, `--sort-by-matching-ends`) and smooth the transitions between clips (`--match-seams`).
+Concatenate all video files in a directory into a single output file. Clips are sorted **alphabetically by filename** by default. Optional flags choose a different ordering (`--shuffle`, `--sort-by-matching-ends`, `--sort-by-intensity`) and smooth the transitions between clips (`--match-seams`).
 
 ### Basic Usage
 
@@ -204,6 +204,15 @@ python concat_clips/concat_clips.py /path/to/videos output.mp4 --shuffle --match
 
 # Order by matching ends, then cut each junction at its best frame
 python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --match-seams
+
+# Order by how much motion each clip contains (quietest first)
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-intensity
+
+# Busiest first instead
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-intensity desc
+
+# Smooth transitions that also build in energy across the sequence
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --sort-by-intensity
 ```
 
 Automatic output naming:
@@ -222,6 +231,7 @@ python concat_clips/concat_clips.py --folder /path/to/videos
 | `--sort-by-matching-ends` | Order clips so each beginning continues the previous ending (requires OpenCV; cannot be combined with `--shuffle`) |
 | `--first-clip` | Substring selecting which clip opens the sequence (used with `--sort-by-matching-ends`, default: alphabetically first) |
 | `--sort-window` | Seconds analysed at each clip boundary (used with `--sort-by-matching-ends`, default: 0.25) |
+| `--sort-by-intensity` | Take each clip's overall amount of motion into account, `asc` (default) or `desc` (requires OpenCV; cannot be combined with `--shuffle`) |
 | `--match-seams` | Match seams between clips using motion-aware frame comparison (requires OpenCV) |
 | `--haystack-duration` | Seconds to search for best match (used with `--match-seams`, default: 1.0) |
 | `--haystack-skip` | Seconds to skip at start of each clip before searching (default: 0.0) |
@@ -247,6 +257,31 @@ The chosen order and each transition's score are printed, lower being smoother.
 
 **Combining.** `--sort-by-matching-ends` cannot be used with `--shuffle` — one randomises the order, the other derives it — and attempting both is an error. It does compose with `--match-seams`: ordering decides which clips adjoin, then seam matching decides where each junction is cut.
 
+### Clip Intensity (`--sort-by-intensity [asc|desc]`)
+
+Each clip is sampled end to end at a fixed rate and scored on how much the picture changes between samples — a locked-off shot of an empty room scores near zero, a busy street scores high. The rate is the same for every clip, so a long clip is not made to look busier than it is by being sampled more sparsely. This costs one extra decode pass per clip, cheap next to the full re-encode every clip already gets on the way into the concatenation.
+
+The measured value for each clip is printed alongside the chosen order.
+
+**On its own**, it orders the clips outright: quietest first for `asc` (the default), busiest first for `desc`. Clips whose motion could not be measured go last in either direction.
+
+**Layered onto `--sort-by-matching-ends`**, it becomes one half of the decision instead:
+
+- The sequence opens on the quietest clip for `asc`, or the busiest for `desc`, so the arc has somewhere to go. An ascending arc that opened on the busiest clip could only ever fall. An explicit `--first-clip` still wins over this.
+- At each step the remaining clips are ranked twice — once on transition smoothness, once on intensity — and the blended rank picks the winner, with smoothness deciding exact ties.
+
+The two are combined by *rank* rather than by raw value on purpose. A transition score is in squared grey levels and can differ a hundredfold between visually distinct clips, while intensity is a single number per clip; any fixed weighting between them would be arbitrary, and in practice would leave intensity unable to affect anything at all. Ranking puts them on equal footing.
+
+So the three ordering modes give you a choice of what to optimise:
+
+| Flags | Optimises |
+|-------|-----------|
+| `--sort-by-matching-ends` | Smooth transitions only |
+| `--sort-by-intensity` | The energy arc only |
+| Both together | A balance of the two |
+
+Like `--sort-by-matching-ends`, it cannot be combined with `--shuffle`, and it composes with `--match-seams`.
+
 ### Seam Matching Algorithm (`--match-seams`)
 
 1. Extract the last **2 consecutive frames** of the preceding clip ("needle pair").
@@ -259,6 +294,7 @@ The chosen order and each transition's score are printed, lower being smoother.
 - Alphabetical sort by filename (default)
 - Random shuffle with optional reproducible seed (`--shuffle`, `--seed`)
 - Motion-aware clip ordering from the footage itself (`--sort-by-matching-ends`, `--first-clip`)
+- Ordering by how much motion each clip contains, alone or blended with the above (`--sort-by-intensity`)
 - Motion-aware seam matching for smooth transitions (`--match-seams`)
 - Recursive scanning across subdirectories (default)
 - Auto-detects codec, resolution, and framerate from the first clip

@@ -7,6 +7,8 @@ Usage:
     python concat_clips.py /path/to/videos output.mp4 --shuffle
     python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends
     python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --first-clip joe123
+    python concat_clips.py /path/to/videos output.mp4 --sort-by-intensity
+    python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --sort-by-intensity desc
     python concat_clips.py /path/to/videos output.mp4 --match-seams
     python concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams
     python concat_clips.py --folder /path/to/videos
@@ -17,6 +19,8 @@ Features:
 - Optionally shuffles clips into a random order (--shuffle)
 - Optionally orders clips by how well each beginning continues the previous
   ending (--sort-by-matching-ends), starting from a chosen clip (--first-clip)
+- Optionally takes each clip's overall amount of motion into account
+  (--sort-by-intensity), either as the ordering itself or as a bias on it
 - Optionally matches seams between clips using motion-aware frame comparison (--match-seams)
 - Preserves video specs (codec, resolution, framerate) from the first clip
 - Re-encodes non-conformant clips to match the first clip's specs
@@ -37,6 +41,21 @@ Clip Ordering Algorithm (--sort-by-matching-ends):
 
 Cannot be combined with --shuffle.  Composes with --match-seams: ordering picks
 which clips adjoin, seam matching then picks where each junction is cut.
+
+Clip Intensity (--sort-by-intensity [asc|desc], default asc):
+Each clip is sampled end to end at a fixed rate and scored on how much the
+picture changes between samples — a locked-off shot of an empty room scores
+near zero, a busy street scores high.  The rate is the same for every clip so
+the numbers are comparable.
+
+- On its own, this orders the clips outright: quietest first for "asc",
+  busiest first for "desc".
+- Layered onto --sort-by-matching-ends, it becomes a bias instead: each greedy
+  pick still prefers a smooth transition, but candidates moving the energy in
+  the requested direction are favoured, so the edit builds (or winds down)
+  across the sequence.  A clearly better visual match still wins.
+
+Also cannot be combined with --shuffle.
 
 Seam Matching Algorithm (--match-seams):
 1. For each adjacent pair of clips (A, B), extract frames from:
@@ -900,11 +919,190 @@ def select_first_clip_index(video_files: List[Path], pattern: Optional[str]) -> 
     return matches[0]
 
 
+# ---------------------------
+# Clip intensity (used by --sort-by-intensity)
+# ---------------------------
+
+# Every clip is sampled at this fixed rate when measuring intensity.  The rate
+# must be the same for all clips: the metric is how much the picture changes
+# between consecutive samples, and that grows with the gap between them, so
+# sampling a long clip more sparsely would make it look busier than it is.
+INTENSITY_SAMPLE_FPS = 5.0
+
+# How much the intensity trend counts against transition smoothness when
+# --sort-by-intensity is layered onto --sort-by-matching-ends.  The two are
+# combined by *rank* among the candidates rather than by raw value, because
+# their units are incommensurate: a transition score is squared grey levels and
+# can differ a hundredfold between visually distinct clips, whereas the trend is
+# normalised to [-1, 1].  Any fixed multiplier between the two would be
+# arbitrary, and in practice would leave the trend unable to affect anything.
+# Ranking puts them on equal footing: at 1.0 a candidate one place smoother
+# trades evenly against one place better on the energy trend, with smoothness
+# winning exact ties.
+INTENSITY_RANK_WEIGHT = 1.0
+
+
+def measure_clip_intensity(ffmpeg_exe: str, video_path: Path, duration: float, tmpdir: Path) -> Optional[float]:
+    """Measure the overall amount of motion in a clip.
+
+    Samples the whole clip at INTENSITY_SAMPLE_FPS and averages the absolute
+    difference between consecutive samples.  This is the same quantity as a
+    BoundarySignature's ``speed``, measured across the entire clip rather than
+    at one boundary: a locked-off shot of an empty room scores near zero, a
+    busy street scores high.
+
+    Costs one extra decode pass per clip — cheap next to the full re-encode
+    every clip already gets on the way into the concatenation.
+
+    Returns:
+        Mean inter-sample difference, or None when the clip could not be
+        sampled (unknown duration, or fewer than two frames recovered).
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --sort-by-intensity. Install with: pip install opencv-python")
+
+    if duration <= 0:
+        return None
+
+    frames = extract_haystack_frames(
+        ffmpeg_exe, video_path, 0.0, duration, INTENSITY_SAMPLE_FPS, tmpdir,
+        downscale_width=SORT_ANALYSIS_WIDTH,
+    )
+    if len(frames) < 2:
+        return None
+
+    diffs = []
+    for i in range(len(frames) - 1):
+        diff = frames[i + 1][1].astype(np.float64) - frames[i][1].astype(np.float64)
+        diffs.append(float(np.mean(np.abs(diff))))
+
+    return float(np.mean(diffs))
+
+
+def measure_clip_intensities(
+    ffmpeg_exe: str,
+    ffprobe_exe: str,
+    video_files: List[Path],
+    tmpdir: Path,
+) -> List[Optional[float]]:
+    """Measure motion intensity for every clip, logging each result."""
+    log(f"\n[intensity] Measuring overall motion in {len(video_files)} clips "
+        f"(sampled at {INTENSITY_SAMPLE_FPS:.0f} fps)...")
+
+    intensities: List[Optional[float]] = []
+    for video_file in video_files:
+        try:
+            specs = get_video_specs(ffprobe_exe, video_file)
+            duration = specs["duration"]
+        except Exception as e:
+            log(f"  WARNING: Could not measure {video_file.name}: {e}")
+            intensities.append(None)
+            continue
+
+        value = measure_clip_intensity(ffmpeg_exe, video_file, duration, tmpdir)
+        if value is None:
+            log(f"  WARNING: Could not measure motion in {video_file.name}")
+        else:
+            log(f"  {video_file.name}: {value:.2f}")
+        intensities.append(value)
+
+    return intensities
+
+
+def order_clips_by_intensity(
+    names: List[str],
+    intensities: List[Optional[float]],
+    direction: str = "asc",
+) -> List[int]:
+    """Order clips purely by how much motion they contain.
+
+    Args:
+        names: Filename of each clip, used for tie-breaking.
+        intensities: Measured intensity per clip (None when unmeasurable).
+        direction: "asc" for quietest first, "desc" for busiest first.
+
+    Returns:
+        Indices of the clips in their new order.  Clips that could not be
+        measured go last in both directions — an unknown value is not a reason
+        to open the sequence.
+    """
+    if direction not in ("asc", "desc"):
+        raise ValueError(f"intensity direction must be 'asc' or 'desc', got {direction!r}")
+
+    return sorted(
+        range(len(names)),
+        key=lambda i: intensity_sort_key(intensities[i], direction) + (names[i], i),
+    )
+
+
+def select_first_clip_by_intensity(
+    intensities: List[Optional[float]],
+    direction: str = "asc",
+) -> Optional[int]:
+    """Pick the clip that should open an intensity arc.
+
+    An arc can only build if it starts at the right end: opening on the busiest
+    clip makes "ascending" impossible no matter how the rest is ordered.  So
+    when an intensity direction is requested and no explicit --first-clip
+    overrides it, the sequence opens on the quietest clip for "asc" and the
+    busiest for "desc".
+
+    Returns:
+        Index of the opening clip, or None when nothing could be measured.
+    """
+    measured = [(value, i) for i, value in enumerate(intensities) if value is not None]
+    if not measured:
+        return None
+    if direction == "desc":
+        # Busiest first; among equals, the alphabetically first (lowest index).
+        return max(measured, key=lambda pair: (pair[0], -pair[1]))[1]
+    return min(measured, key=lambda pair: (pair[0], pair[1]))[1]
+
+
+def intensity_sort_key(value: Optional[float], direction: str = "asc") -> Tuple[int, float]:
+    """Sort key placing a clip in the requested intensity order.
+
+    Unmeasurable clips sort last in both directions — an unknown value is not a
+    reason to open the sequence, nor to interrupt an arc partway.
+
+    Note this ranks clips by their own intensity rather than by the change from
+    whatever precedes them.  Chasing the largest change at each step would open
+    an ascending arc by jumping straight to the busiest clip, stranding the
+    sequence with nowhere to climb; ordering by absolute intensity is what
+    actually produces a build.
+    """
+    if value is None:
+        return (1, 0.0)
+    return (0, -value if direction == "desc" else value)
+
+
+def rank_map(items: List[int], key) -> dict:
+    """Rank items by key, lowest first, with tied values sharing the lower rank.
+
+    Ties must share a rank so that a group of equally-good candidates does not
+    get silently ordered by an accident of list position.
+    """
+    ranks = {}
+    previous_key = None
+    previous_rank = 0
+    for position, item in enumerate(sorted(items, key=key)):
+        current_key = key(item)
+        if previous_key is not None and current_key == previous_key:
+            ranks[item] = previous_rank
+        else:
+            ranks[item] = position
+            previous_rank = position
+            previous_key = current_key
+    return ranks
+
+
 def order_clips_by_matching_ends(
     names: List[str],
     tails: List[Optional[BoundarySignature]],
     heads: List[Optional[BoundarySignature]],
     first_index: int,
+    intensities: Optional[List[Optional[float]]] = None,
+    intensity_direction: Optional[str] = None,
 ) -> List[int]:
     """Greedily order clips so each one continues from the previous one.
 
@@ -924,6 +1122,12 @@ def order_clips_by_matching_ends(
         tails: Tail signature per clip (None when analysis failed).
         heads: Head signature per clip (None when analysis failed).
         first_index: Index of the clip to place first.
+        intensities: Optional measured intensity per clip.  When supplied along
+            with intensity_direction, candidates are ranked both on transition
+            smoothness and on intensity, and the blended rank decides — so the
+            sequence builds or winds down in energy while still cutting cleanly.
+            Smoothness alone decides exact ties.
+        intensity_direction: "asc" or "desc"; ignored when intensities is None.
 
     Returns:
         Indices of the clips in their new order.
@@ -934,23 +1138,37 @@ def order_clips_by_matching_ends(
     if not 0 <= first_index < n:
         raise ValueError(f"first_index {first_index} out of range for {n} clips")
 
+    use_intensity = intensities is not None and intensity_direction is not None
+
     order = [first_index]
     remaining = [i for i in range(n) if i != first_index]
 
     while remaining:
-        tail = tails[order[-1]]
-        best_key: Optional[Tuple[float, str, int]] = None
-        best_i = remaining[0]
+        current = order[-1]
+        tail = tails[current]
+
+        scores = {}
         for i in remaining:
             head = heads[i]
             if tail is None or head is None:
-                score = float('inf')
+                scores[i] = float('inf')
             else:
-                score = score_clip_transition(tail, head)
-            key = (score, names[i], i)
-            if best_key is None or key < best_key:
-                best_key = key
-                best_i = i
+                scores[i] = score_clip_transition(tail, head)
+
+        if use_intensity:
+            smoothness_rank = rank_map(remaining, key=lambda i: scores[i])
+            intensity_rank = rank_map(
+                remaining, key=lambda i: intensity_sort_key(intensities[i], intensity_direction)
+            )
+            best_i = min(remaining, key=lambda i: (
+                smoothness_rank[i] + INTENSITY_RANK_WEIGHT * intensity_rank[i],
+                scores[i],
+                names[i],
+                i,
+            ))
+        else:
+            best_i = min(remaining, key=lambda i: (scores[i], names[i], i))
+
         order.append(best_i)
         remaining.remove(best_i)
 
@@ -965,6 +1183,7 @@ def sort_clips_by_matching_ends(
     sort_window: float = 0.25,
     haystack_skip: float = 0.0,
     first_clip: Optional[str] = None,
+    intensity_direction: Optional[str] = None,
 ) -> List[Path]:
     """Reorder clips so each clip's beginning continues the previous clip's end.
 
@@ -980,6 +1199,9 @@ def sort_clips_by_matching_ends(
             the same option in seam matching.
         first_clip: Substring selecting the opening clip (see
             ``select_first_clip_index``).
+        intensity_direction: When "asc" or "desc", also measure each clip's
+            overall motion and bias the ordering towards rising or falling
+            energy (see ``intensity_trend_bonus``).
 
     Returns:
         The clips in their new order.
@@ -987,11 +1209,27 @@ def sort_clips_by_matching_ends(
     if not HAS_OPENCV:
         raise RuntimeError("OpenCV is required for --sort-by-matching-ends. Install with: pip install opencv-python")
 
+    trend_desc = f", intensity {intensity_direction}" if intensity_direction else ""
     log(f"\n[sort] Ordering {len(video_files)} clips by matching ends "
-        f"(window={sort_window:.2f}s)...")
+        f"(window={sort_window:.2f}s{trend_desc})...")
 
-    # Validated even for a single clip, so a typo'd --first-clip is still caught.
-    first_index = select_first_clip_index(video_files, first_clip)
+    # Measured up front: with no explicit --first-clip, the opening clip is the
+    # quiet (or busy) end of the range rather than the alphabetical one.
+    intensities: Optional[List[Optional[float]]] = None
+    if intensity_direction:
+        intensities = measure_clip_intensities(ffmpeg_exe, ffprobe_exe, video_files, tmpdir)
+
+    if first_clip is not None or intensities is None:
+        # Validated even for a single clip, so a typo'd --first-clip is still caught.
+        first_index = select_first_clip_index(video_files, first_clip)
+    else:
+        first_index = select_first_clip_by_intensity(intensities, intensity_direction)
+        if first_index is None:
+            log("  WARNING: No clip intensities could be measured; opening alphabetically")
+            first_index = 0
+        else:
+            extreme = "quietest" if intensity_direction == "asc" else "busiest"
+            log(f"  First clip: {video_files[first_index].name} ({extreme} of the set)")
 
     if len(video_files) < 2:
         return list(video_files)
@@ -1043,12 +1281,13 @@ def sort_clips_by_matching_ends(
         tails.append(tail_sig)
 
     order = order_clips_by_matching_ends(
-        [f.name for f in video_files], tails, heads, first_index
+        [f.name for f in video_files], tails, heads, first_index,
+        intensities=intensities, intensity_direction=intensity_direction,
     )
     ordered = [video_files[i] for i in order]
 
     log("[sort] Order chosen (transition score, lower = smoother):")
-    log(f"  1. {ordered[0].name}")
+    log(f"  1. {ordered[0].name}{_intensity_suffix(intensities, order[0])}")
     for pos in range(1, len(order)):
         tail = tails[order[pos - 1]]
         head = heads[order[pos]]
@@ -1056,7 +1295,51 @@ def sort_clips_by_matching_ends(
             score_desc = "n/a"
         else:
             score_desc = f"{score_clip_transition(tail, head):.2f}"
-        log(f"  {pos + 1}. {ordered[pos].name} (score={score_desc})")
+        log(f"  {pos + 1}. {ordered[pos].name} (score={score_desc}"
+            f"{_intensity_suffix(intensities, order[pos], prefix=', ')})")
+
+    return ordered
+
+
+def _intensity_suffix(intensities: Optional[List[Optional[float]]], index: int, prefix: str = " ") -> str:
+    """Format a clip's measured intensity for the order listing, if measured."""
+    if intensities is None or intensities[index] is None:
+        return ""
+    return f"{prefix}intensity={intensities[index]:.2f}"
+
+
+def sort_clips_by_intensity(
+    ffmpeg_exe: str,
+    ffprobe_exe: str,
+    video_files: List[Path],
+    tmpdir: Path,
+    direction: str = "asc",
+) -> List[Path]:
+    """Reorder clips purely by how much motion each one contains.
+
+    Args:
+        video_files: Clips, already sorted alphabetically by find_video_files.
+        tmpdir: Scratch directory for extracted frames.
+        direction: "asc" for quietest first, "desc" for busiest first.
+
+    Returns:
+        The clips in their new order.
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --sort-by-intensity. Install with: pip install opencv-python")
+
+    log(f"\n[sort] Ordering {len(video_files)} clips by intensity ({direction})...")
+
+    if len(video_files) < 2:
+        return list(video_files)
+
+    intensities = measure_clip_intensities(ffmpeg_exe, ffprobe_exe, video_files, tmpdir)
+    order = order_clips_by_intensity([f.name for f in video_files], intensities, direction)
+    ordered = [video_files[i] for i in order]
+
+    log("[sort] Order chosen:")
+    for pos, idx in enumerate(order):
+        log(f"  {pos + 1}. {ordered[pos].name}{_intensity_suffix(intensities, idx, prefix=' ')}")
 
     return ordered
 
@@ -1261,6 +1544,7 @@ def concatenate_videos(
     output_path: Path,
     shuffle: bool = False,
     sort_by_matching_ends: bool = False,
+    sort_by_intensity: Optional[str] = None,
     first_clip: Optional[str] = None,
     match_seams: bool = False,
     seed: Optional[int] = None,
@@ -1278,6 +1562,12 @@ def concatenate_videos(
         sort_by_matching_ends: If True, order clips so each clip's beginning
             continues the previous clip's end, judging both frame appearance and
             the direction and speed of motion. Mutually exclusive with shuffle.
+        sort_by_intensity: "asc" or "desc" to take each clip's overall amount of
+            motion into account. On its own it orders the clips outright,
+            quietest or busiest first. Layered onto sort_by_matching_ends it
+            becomes a bias, nudging the sequence towards rising or falling
+            energy while still favouring smooth transitions. Mutually exclusive
+            with shuffle.
         first_clip: Substring selecting which clip opens the sequence (used only
             with sort_by_matching_ends; defaults to the alphabetically first clip).
         match_seams: If True, find best matching seam for each pair of adjacent clips by
@@ -1302,6 +1592,13 @@ def concatenate_videos(
         raise ValueError("--shuffle and --sort-by-matching-ends cannot be combined: "
                          "one randomises the order, the other derives it from the footage")
 
+    if shuffle and sort_by_intensity:
+        raise ValueError("--shuffle and --sort-by-intensity cannot be combined: "
+                         "one randomises the order, the other derives it from the footage")
+
+    if sort_by_intensity is not None and sort_by_intensity not in ("asc", "desc"):
+        raise ValueError(f"--sort-by-intensity must be 'asc' or 'desc', got {sort_by_intensity!r}")
+
     if first_clip is not None and not sort_by_matching_ends:
         raise ValueError("--first-clip only applies to --sort-by-matching-ends")
 
@@ -1310,6 +1607,9 @@ def concatenate_videos(
 
     if sort_by_matching_ends and not HAS_OPENCV:
         raise RuntimeError("OpenCV is required for --sort-by-matching-ends. Install with: pip install opencv-python")
+
+    if sort_by_intensity and not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --sort-by-intensity. Install with: pip install opencv-python")
 
     if match_seams and haystack_duration <= 0:
         raise ValueError("haystack_duration must be positive")
@@ -1336,10 +1636,20 @@ def concatenate_videos(
                 sort_window=sort_window,
                 haystack_skip=haystack_skip,
                 first_clip=first_clip,
+                intensity_direction=sort_by_intensity,
+            )
+    elif sort_by_intensity:
+        with tempfile.TemporaryDirectory() as sort_tmpdir:
+            ordered_files = sort_clips_by_intensity(
+                ffmpeg_exe,
+                ffprobe_exe,
+                ordered_files,
+                Path(sort_tmpdir),
+                direction=sort_by_intensity,
             )
     else:
         log(f"\n[order] Processing {len(ordered_files)} video files in alphabetical order")
-    if not sort_by_matching_ends:
+    if not (sort_by_matching_ends or sort_by_intensity):
         # The ordering pass already printed the sequence with its transition
         # scores; repeating it here would just be the same list twice.
         for i, f in enumerate(ordered_files):
@@ -1555,6 +1865,13 @@ Example usage:
   python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --first-clip joe123
   python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --match-seams
 
+  # Order by how much motion each clip contains
+  python concat_clips.py /path/to/videos output.mp4 --sort-by-intensity
+  python concat_clips.py /path/to/videos output.mp4 --sort-by-intensity desc
+
+  # Smooth transitions that also build in energy across the sequence
+  python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --sort-by-intensity
+
   # Match seams between clips for smoother transitions
   python concat_clips.py /path/to/videos output.mp4 --match-seams
   python concat_clips.py /path/to/videos output.mp4 --match-seams --haystack-duration 2.0
@@ -1584,6 +1901,12 @@ Example usage:
                     help="Order clips so each clip's beginning continues the previous clip's end, "
                          "matching frame appearance and motion direction/speed (requires OpenCV; "
                          "cannot be combined with --shuffle)")
+    ap.add_argument("--sort-by-intensity", type=str.lower, nargs="?", const="asc", default=None,
+                    choices=["asc", "desc"],
+                    help="Take each clip's overall amount of motion into account (requires OpenCV; "
+                         "default direction: asc). Alone it orders clips outright, quietest first; "
+                         "with --sort-by-matching-ends it biases that ordering towards rising "
+                         "(or with 'desc', falling) energy. Cannot be combined with --shuffle")
     ap.add_argument("--first-clip", type=str, default=None,
                     help="Substring selecting which clip opens the sequence, e.g. --first-clip joe123 "
                          "matches joe123-final.mp4 (used with --sort-by-matching-ends; "
@@ -1610,6 +1933,11 @@ Example usage:
         log("One randomises the clip order; the other derives it from the footage.")
         sys.exit(1)
 
+    if args.shuffle and args.sort_by_intensity:
+        log("ERROR: --shuffle and --sort-by-intensity cannot be combined.")
+        log("One randomises the clip order; the other derives it from the footage.")
+        sys.exit(1)
+
     if args.first_clip is not None:
         if not args.sort_by_matching_ends:
             log("ERROR: --first-clip only applies to --sort-by-matching-ends.")
@@ -1625,6 +1953,10 @@ Example usage:
         sys.exit(1)
     if args.sort_by_matching_ends and not HAS_OPENCV:
         log("ERROR: OpenCV is required for --sort-by-matching-ends.")
+        log("Install with: pip install opencv-python")
+        sys.exit(1)
+    if args.sort_by_intensity and not HAS_OPENCV:
+        log("ERROR: OpenCV is required for --sort-by-intensity.")
         log("Install with: pip install opencv-python")
         sys.exit(1)
 
@@ -1696,6 +2028,7 @@ Example usage:
             output_file,
             shuffle=args.shuffle,
             sort_by_matching_ends=args.sort_by_matching_ends,
+            sort_by_intensity=args.sort_by_intensity,
             first_clip=args.first_clip,
             match_seams=args.match_seams,
             seed=args.seed,
