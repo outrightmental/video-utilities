@@ -9,7 +9,7 @@ A collection of free, open-source command-line video utilities for processing, c
 ## Table of Contents
 
 - [Requirements](#requirements)
-- [motion\_cctv — Motion-Only Clip Extraction](#motion_cctv--motion-only-clip-extraction)
+- [extract\_motion — Motion-Only Clip Extraction](#extract_motion--motion-only-clip-extraction)
 - [concat\_clips — Concatenate Video Clips](#concat_clips--concatenate-video-clips)
 - [Contributing](#contributing)
 - [License](#license)
@@ -41,15 +41,15 @@ Or ensure `ffmpeg` and `ffprobe` are on your `PATH`.
 
 ---
 
-## motion\_cctv — Motion-Only Clip Extraction
+## extract\_motion — Motion-Only Clip Extraction
 
-**Location:** [`motion_cctv/`](motion_cctv/)
+**Location:** [`extract_motion/`](extract_motion/)
 
-Extract motion-only clips from security camera (or any other) footage using background subtraction and sustained-motion detection.
+Extract motion-only clips from any footage using background subtraction and sustained-motion detection. Long, mostly-static recordings — security cameras, dashcams, trail cameras, timelapses, locked-off b-roll — benefit most, but nothing about the tool is tied to a particular source.
 
 ### Why?
 
-Most tools use frame-difference or scene-cut detection, which fails on security/CCTV footage because lighting flickers, compression artefacts, and brief spikes produce hundreds of useless micro-clips. `motion_cctv` instead answers:
+Most tools use frame-difference or scene-cut detection, which falls apart on real-world continuous footage: lighting flickers, compression artefacts, and brief spikes produce hundreds of useless micro-clips. `extract_motion` instead answers:
 
 > **"Has something actually been moving in the scene for long enough to matter?"**
 
@@ -65,7 +65,7 @@ Most tools use frame-difference or scene-cut detection, which fails on security/
 ### Basic Usage
 
 ```bash
-python motion_cctv/motion_cctv.py /path/to/video_folder
+python extract_motion/extract_motion.py /path/to/video_folder
 ```
 
 Output:
@@ -108,7 +108,7 @@ python -c "import cv2; print('CUDA devices:', cv2.cuda.getCudaEnabledDeviceCount
 #### FFmpeg Hardware Decoding
 
 ```bash
-python motion_cctv/motion_cctv.py /path/to/videos --hwaccel-decode
+python extract_motion/extract_motion.py /path/to/videos --hwaccel-decode
 ```
 
 Supports NVIDIA NVDEC, Intel Quick Sync, VA-API (Linux), and VideoToolbox (macOS).
@@ -120,7 +120,7 @@ Automatically detects GPU encoders: NVENC, Quick Sync, VA-API, VideoToolbox.
 #### Disable GPU
 
 ```bash
-python motion_cctv/motion_cctv.py /path/to/videos --no-gpu
+python extract_motion/extract_motion.py /path/to/videos --no-gpu
 ```
 
 ### Performance Optimizations
@@ -134,7 +134,7 @@ python motion_cctv/motion_cctv.py /path/to/videos --no-gpu
 Combined example for maximum throughput:
 
 ```bash
-python motion_cctv/motion_cctv.py /path/to/videos \
+python extract_motion/extract_motion.py /path/to/videos \
   --downscale-width 640 \
   --frame-skip 2 \
   --hwaccel-decode \
@@ -152,7 +152,7 @@ python motion_cctv/motion_cctv.py /path/to/videos \
 ### ROI (Ignoring Noisy Regions)
 
 ```bash
-python motion_cctv/motion_cctv.py /path/to/videos --roi 0,0.2,1,0.8
+python extract_motion/extract_motion.py /path/to/videos --roi 0,0.2,1,0.8
 ```
 
 Format: `x,y,width,height` (fractions 0.0–1.0).
@@ -168,7 +168,7 @@ Format: `x,y,width,height` (fractions 0.0–1.0).
 ### Tests
 
 ```bash
-python motion_cctv/test_e2e.py
+python extract_motion/test_e2e.py
 ```
 
 Requires example footage in `example_footage/`. The test is skipped when footage is absent.
@@ -179,7 +179,7 @@ Requires example footage in `example_footage/`. The test is skipped when footage
 
 **Location:** [`concat_clips/`](concat_clips/)
 
-Concatenate all video files in a directory into a single output file. Clips are sorted **alphabetically by filename** by default. Optional `--shuffle` and `--match-seams` flags enable random ordering and smooth motion-aware seam transitions.
+Concatenate all video files in a directory into a single output file. Clips are sorted **alphabetically by filename** by default. Optional flags choose a different ordering (`--shuffle`, `--sort-by-matching-ends`) and smooth the transitions between clips (`--match-seams`).
 
 ### Basic Usage
 
@@ -190,11 +190,20 @@ python concat_clips/concat_clips.py /path/to/videos output.mp4
 # Shuffle into a random order
 python concat_clips/concat_clips.py /path/to/videos output.mp4 --shuffle
 
+# Order clips so each beginning continues the previous ending (requires OpenCV)
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends
+
+# Start that ordering from a particular clip
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --first-clip joe123
+
 # Match seams between clips for smoother transitions (requires OpenCV)
 python concat_clips/concat_clips.py /path/to/videos output.mp4 --match-seams
 
 # Shuffle and match seams together
 python concat_clips/concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams --seed 42
+
+# Order by matching ends, then cut each junction at its best frame
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --match-seams
 ```
 
 Automatic output naming:
@@ -210,6 +219,9 @@ python concat_clips/concat_clips.py --folder /path/to/videos
 |--------|-------------|
 | `--shuffle` | Shuffle clips into a random order (default: alphabetical) |
 | `--seed` | Random seed for reproducible shuffling (used with `--shuffle`) |
+| `--sort-by-matching-ends` | Order clips so each beginning continues the previous ending (requires OpenCV; cannot be combined with `--shuffle`) |
+| `--first-clip` | Substring selecting which clip opens the sequence (used with `--sort-by-matching-ends`, default: alphabetically first) |
+| `--sort-window` | Seconds analysed at each clip boundary (used with `--sort-by-matching-ends`, default: 0.25) |
 | `--match-seams` | Match seams between clips using motion-aware frame comparison (requires OpenCV) |
 | `--haystack-duration` | Seconds to search for best match (used with `--match-seams`, default: 1.0) |
 | `--haystack-skip` | Seconds to skip at start of each clip before searching (default: 0.0) |
@@ -217,6 +229,23 @@ python concat_clips/concat_clips.py --folder /path/to/videos
 | `--no-recursive` | Don't search subdirectories (default: recursive) |
 | `--fps` | Output framerate (H.264 bitstream remux) |
 | `--ffmpeg` / `--ffprobe` | Custom executable paths |
+
+### Clip Ordering Algorithm (`--sort-by-matching-ends`)
+
+Instead of trusting filenames, this derives the running order from the footage itself — each clip is followed by whichever remaining clip picks up closest to where it left off.
+
+1. Analyse a short window (`--sort-window`, default 0.25s) at **both ends of every clip**. That is two ffmpeg passes per clip, not one per pair. Frames are downscaled and blurred, then summarized as three things: the boundary frame itself, an aggregate motion vector, and an average speed.
+2. Score every possible transition A → B on three criteria:
+   - **Appearance** — how alike A's last frame and B's first frame look (MSE).
+   - **Direction** — whether both are moving the same way, so a leftward pan is not followed by a rightward one. Direction comes from centroid displacement (centroid of appearing pixels minus centroid of disappearing pixels), which encodes *where things moved* rather than what they look like. It is faded out when either clip's motion is too small to trust, so noise in a static shot cannot fake a direction.
+   - **Speed** — whether both are moving at a comparable rate, so the cut does not jump from a fast pan to a near-freeze.
+3. Starting from the first clip, greedily append whichever unused clip scores best against the current clip's end. Ties break on filename, so the result is deterministic.
+
+The chosen order and each transition's score are printed, lower being smoother.
+
+**Choosing the first clip.** By default the sequence opens with the alphabetically first clip. `--first-clip` takes a substring searched within each filename — `--first-clip joe123` matches `joe123-final.mp4`. Matching is case-insensitive; if several clips match, the alphabetically first one wins and the rest are listed as a warning; if none match, the run stops rather than silently guessing.
+
+**Combining.** `--sort-by-matching-ends` cannot be used with `--shuffle` — one randomises the order, the other derives it — and attempting both is an error. It does compose with `--match-seams`: ordering decides which clips adjoin, then seam matching decides where each junction is cut.
 
 ### Seam Matching Algorithm (`--match-seams`)
 
@@ -229,6 +258,7 @@ python concat_clips/concat_clips.py --folder /path/to/videos
 
 - Alphabetical sort by filename (default)
 - Random shuffle with optional reproducible seed (`--shuffle`, `--seed`)
+- Motion-aware clip ordering from the footage itself (`--sort-by-matching-ends`, `--first-clip`)
 - Motion-aware seam matching for smooth transitions (`--match-seams`)
 - Recursive scanning across subdirectories (default)
 - Auto-detects codec, resolution, and framerate from the first clip

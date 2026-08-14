@@ -5,6 +5,8 @@ concat_clips.py — Concatenate all video clips into one file.
 Usage:
     python concat_clips.py /path/to/videos output.mp4
     python concat_clips.py /path/to/videos output.mp4 --shuffle
+    python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends
+    python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --first-clip joe123
     python concat_clips.py /path/to/videos output.mp4 --match-seams
     python concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams
     python concat_clips.py --folder /path/to/videos
@@ -13,11 +15,28 @@ Features:
 - Recursively finds all video files in the input directory
 - Sorts clips alphabetically by filename (default)
 - Optionally shuffles clips into a random order (--shuffle)
+- Optionally orders clips by how well each beginning continues the previous
+  ending (--sort-by-matching-ends), starting from a chosen clip (--first-clip)
 - Optionally matches seams between clips using motion-aware frame comparison (--match-seams)
 - Preserves video specs (codec, resolution, framerate) from the first clip
 - Re-encodes non-conformant clips to match the first clip's specs
 - Concatenates all clips using FFmpeg concat demuxer
 - Handles various video formats (mp4, avi, mkv, mov, etc.)
+
+Clip Ordering Algorithm (--sort-by-matching-ends):
+1. Analyse a short window (--sort-window, default 0.25s) at both ends of every
+   clip.  Frames are downscaled and blurred, then summarized as: the boundary
+   frame itself, an aggregate motion vector, and an average speed.
+2. Score every possible transition A → B on three criteria: how alike A's last
+   frame and B's first frame look, whether both are moving in the same direction
+   (so a leftward pan is not followed by a rightward one), and whether they are
+   moving at a comparable speed.
+3. Starting from the first clip — alphabetically first, or the first match for
+   --first-clip — greedily append whichever unused clip scores best against the
+   current clip's end.
+
+Cannot be combined with --shuffle.  Composes with --match-seams: ordering picks
+which clips adjoin, seam matching then picks where each junction is cut.
 
 Seam Matching Algorithm (--match-seams):
 1. For each adjacent pair of clips (A, B), extract frames from:
@@ -49,7 +68,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Tuple, Optional, Any
+from typing import List, NamedTuple, Tuple, Optional, Any
 
 try:
     import cv2
@@ -289,8 +308,22 @@ def get_last_two_frames(ffmpeg_exe: str, ffprobe_exe: str, video_path: Path, tmp
             except OSError:
                 pass
 
-def preprocess_frame_for_comparison(frame: Any, blur_size: int = 5) -> Any:
-    """Preprocess frame for comparison: grayscale + Gaussian blur."""
+def preprocess_frame_for_comparison(frame: Any, blur_size: int = 5, downscale_width: Optional[int] = None) -> Any:
+    """Preprocess frame for comparison: optional downscale + grayscale + Gaussian blur.
+
+    Args:
+        frame: BGR frame as read by ``cv2.imread``.
+        blur_size: Gaussian kernel size used to suppress compression noise.
+        downscale_width: When set, first shrink the frame to this width (keeping
+            aspect ratio) before further processing.  Used by the clip-ordering
+            pass, which compares every clip against every other clip and so
+            benefits from cheaper, noise-tolerant frames.  Frames narrower than
+            this width are left alone — we never upscale.
+    """
+    if downscale_width is not None and frame.shape[1] > downscale_width:
+        scale = downscale_width / frame.shape[1]
+        new_size = (downscale_width, max(1, int(round(frame.shape[0] * scale))))
+        frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
     # Convert to grayscale
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     # Apply Gaussian blur to reduce noise
@@ -513,6 +546,7 @@ def extract_haystack_frames(
     duration: float,
     fps: float,
     tmpdir: Path,
+    downscale_width: Optional[int] = None,
 ) -> List[Tuple[float, Any]]:
     """Extract preprocessed frames from a video segment for seam analysis.
 
@@ -523,6 +557,8 @@ def extract_haystack_frames(
         duration: Duration in seconds of the segment to extract.
         fps: Frames per second to use for extraction.
         tmpdir: Temporary directory for intermediate frame files.
+        downscale_width: Optional width to shrink frames to before analysis
+            (see ``preprocess_frame_for_comparison``).
 
     Returns:
         List of (timestamp_in_original_file, preprocessed_frame) tuples sorted
@@ -559,7 +595,8 @@ def extract_haystack_frames(
             frame = cv2.imread(str(frame_path))
             if frame is not None:
                 timestamp = start_time + idx * frame_interval
-                frames.append((timestamp, preprocess_frame_for_comparison(frame)))
+                frames.append((timestamp, preprocess_frame_for_comparison(
+                    frame, downscale_width=downscale_width)))
     finally:
         try:
             for f in batch_dir.glob("*.png"):
@@ -688,6 +725,340 @@ def find_best_seam(
                 best_suc_time = b_next_time
 
     return best_pre_time, best_suc_time, best_score
+
+
+# ---------------------------
+# Clip ordering (used by --sort-by-matching-ends)
+# ---------------------------
+
+# Frames are shrunk to this width before ordering analysis.  Ordering compares
+# every clip against every other clip, so cheap frames matter; the downscale
+# also suppresses compression noise that would otherwise swamp the appearance
+# term.
+SORT_ANALYSIS_WIDTH = 256
+
+# How strongly motion-direction agreement moves the transition score.  A perfect
+# continuation divides the score by 1.5; a full reversal divides it by 0.5 (i.e.
+# doubles it).  Unlike seam matching — where a reversal is merely not rewarded —
+# ordering actively penalises reversals, because picking a different clip is
+# free whereas a seam has no alternative candidate.
+SORT_DIRECTION_WEIGHT = 0.5
+
+# How strongly matching speeds move the transition score.  Secondary to
+# direction: a cut from a fast pan to a near-still shot reads as a jump even
+# when both move the same way.
+SORT_SPEED_WEIGHT = 0.25
+
+# Centroid displacement (in analysis-frame pixels) at which a motion estimate is
+# trusted completely.  Below this the direction term is faded out proportionally,
+# so noise in a static clip cannot masquerade as directional motion.
+SORT_CONFIDENT_DISPLACEMENT_PX = 1.0
+
+
+class BoundarySignature(NamedTuple):
+    """What a clip looks like, and how it is moving, at one of its boundaries.
+
+    Attributes:
+        frame: The boundary frame itself — the clip's last frame for a tail
+            signature, its first frame for a head signature.  This is what the
+            appearance term compares.
+        motion: Aggregate 2-D motion vector (row, col) summed over the analysis
+            window, in analysis-frame pixels.  Summing across the window lets
+            genuine motion accumulate while random per-frame noise cancels out.
+        speed: Mean absolute inter-frame difference across the window — how fast
+            the picture is changing, regardless of direction.
+    """
+    frame: Any
+    motion: Any
+    speed: float
+
+
+def summarize_boundary(frames: List[Tuple[float, Any]], at_end: bool) -> Optional[BoundarySignature]:
+    """Summarize appearance and motion at one boundary of a clip.
+
+    Args:
+        frames: List of (timestamp, preprocessed_frame) tuples in chronological
+            order, covering the analysis window at one end of a clip.
+        at_end: True for a tail window (boundary frame is the last one), False
+            for a head window (boundary frame is the first one).
+
+    Returns:
+        A BoundarySignature, or None when no frames were available.  A window
+        holding a single frame yields zero motion and zero speed rather than
+        failing — appearance alone still orders such a clip.
+    """
+    if not frames:
+        return None
+
+    boundary_frame = frames[-1][1] if at_end else frames[0][1]
+
+    motion = np.zeros(2)
+    speeds: List[float] = []
+    for i in range(len(frames) - 1):
+        diff = frames[i + 1][1].astype(np.float64) - frames[i][1].astype(np.float64)
+        motion = motion + _centroid_displacement(diff)
+        speeds.append(float(np.mean(np.abs(diff))))
+
+    speed = float(np.mean(speeds)) if speeds else 0.0
+    return BoundarySignature(frame=boundary_frame, motion=motion, speed=speed)
+
+
+def score_clip_transition(tail: BoundarySignature, head: BoundarySignature) -> float:
+    """Score how well one clip's head continues from another clip's tail.
+
+    Three criteria, in descending order of importance:
+
+    1. **Appearance** – the two boundary frames look alike (low MSE).
+    2. **Direction** – both clips are moving the same way across the cut, so a
+       subject panning left does not suddenly pan right.  Direction is derived
+       from centroid displacement (centroid of appearing pixels minus centroid
+       of disappearing pixels), which encodes where things moved rather than
+       what they look like, and is faded out when either clip's motion is too
+       small to trust.
+    3. **Speed** – both clips are moving at a comparable rate, so the cut does
+       not jump from a fast pan to a near-freeze.
+
+    The formula mirrors ``find_best_seam``::
+
+        score = (appearance + 1.0) / (direction_bonus * speed_bonus)
+
+    Adding 1.0 to the appearance term keeps direction and speed meaningful when
+    two boundary frames are identical (MSE = 0).  A lower score is better.
+    """
+    appearance = compute_frame_difference(tail.frame, head.frame)
+    if appearance == float('inf'):
+        return float('inf')
+
+    norm_tail = float(np.linalg.norm(tail.motion))
+    norm_head = float(np.linalg.norm(head.motion))
+    if norm_tail > 1e-6 and norm_head > 1e-6:
+        direction = float(np.dot(tail.motion, head.motion) / (norm_tail * norm_head))
+        confidence = min(1.0, min(norm_tail, norm_head) / SORT_CONFIDENT_DISPLACEMENT_PX)
+    else:
+        direction = 0.0
+        confidence = 0.0
+
+    # direction ∈ [-1, 1] → bonus ∈ [0.5, 1.5] at full confidence.
+    direction_bonus = 1.0 + SORT_DIRECTION_WEIGHT * direction * confidence
+
+    faster = max(tail.speed, head.speed)
+    # Two equally static boundaries are perfectly continuous, not undefined.
+    speed_similarity = (min(tail.speed, head.speed) / faster) if faster > 1e-6 else 1.0
+    speed_bonus = 1.0 + SORT_SPEED_WEIGHT * speed_similarity
+
+    return (appearance + 1.0) / (direction_bonus * speed_bonus)
+
+
+def select_first_clip_index(video_files: List[Path], pattern: Optional[str]) -> int:
+    """Pick which clip starts the sequence.
+
+    Args:
+        video_files: Clips, already sorted alphabetically by find_video_files.
+        pattern: Case-insensitive substring to search for. ``None`` (or empty)
+            selects the alphabetically first clip.  The substring is matched
+            against each filename, and — only if nothing matches there — against
+            each full path, so a pattern naming a subdirectory still works when
+            scanning recursively.
+
+    Returns:
+        Index into video_files of the clip to place first.
+
+    Raises:
+        ValueError: If the pattern matches no clip.
+    """
+    if not video_files:
+        raise ValueError("No video files to choose a first clip from")
+    if not pattern:
+        return 0
+
+    needle = pattern.lower()
+
+    matches = [i for i, p in enumerate(video_files) if needle in p.name.lower()]
+    matched_on = "filename"
+    if not matches:
+        matches = [i for i, p in enumerate(video_files) if needle in str(p).lower()]
+        matched_on = "path"
+
+    if not matches:
+        available = ", ".join(p.name for p in video_files[:10])
+        if len(video_files) > 10:
+            available += f", ... ({len(video_files) - 10} more)"
+        raise ValueError(
+            f"--first-clip '{pattern}' did not match any of the {len(video_files)} "
+            f"video files found. Available: {available}"
+        )
+
+    if len(matches) > 1:
+        names = ", ".join(video_files[i].name for i in matches[:5])
+        if len(matches) > 5:
+            names += f", ... ({len(matches) - 5} more)"
+        log(f"  WARNING: --first-clip '{pattern}' matched {len(matches)} files ({names});"
+            f" using the alphabetically first: {video_files[matches[0]].name}")
+
+    log(f"  First clip: {video_files[matches[0]].name} (matched '{pattern}' on {matched_on})")
+    # video_files is sorted, so the first match is the alphabetically first one.
+    return matches[0]
+
+
+def order_clips_by_matching_ends(
+    names: List[str],
+    tails: List[Optional[BoundarySignature]],
+    heads: List[Optional[BoundarySignature]],
+    first_index: int,
+) -> List[int]:
+    """Greedily order clips so each one continues from the previous one.
+
+    Starting from ``first_index``, repeatedly append whichever unused clip has
+    the best (lowest) ``score_clip_transition`` against the current clip's tail.
+
+    This is nearest-neighbour ordering: it optimises each cut in turn rather
+    than the whole sequence, which keeps the result predictable and linear in
+    passes over the clip list.  Clips whose frames could not be analysed score
+    as infinite and therefore settle at the end of the sequence.
+
+    Ties break on filename, then on index, so the ordering is deterministic
+    regardless of dict/set iteration order.
+
+    Args:
+        names: Filename of each clip, used only for tie-breaking.
+        tails: Tail signature per clip (None when analysis failed).
+        heads: Head signature per clip (None when analysis failed).
+        first_index: Index of the clip to place first.
+
+    Returns:
+        Indices of the clips in their new order.
+    """
+    n = len(names)
+    if n == 0:
+        return []
+    if not 0 <= first_index < n:
+        raise ValueError(f"first_index {first_index} out of range for {n} clips")
+
+    order = [first_index]
+    remaining = [i for i in range(n) if i != first_index]
+
+    while remaining:
+        tail = tails[order[-1]]
+        best_key: Optional[Tuple[float, str, int]] = None
+        best_i = remaining[0]
+        for i in remaining:
+            head = heads[i]
+            if tail is None or head is None:
+                score = float('inf')
+            else:
+                score = score_clip_transition(tail, head)
+            key = (score, names[i], i)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_i = i
+        order.append(best_i)
+        remaining.remove(best_i)
+
+    return order
+
+
+def sort_clips_by_matching_ends(
+    ffmpeg_exe: str,
+    ffprobe_exe: str,
+    video_files: List[Path],
+    tmpdir: Path,
+    sort_window: float = 0.25,
+    haystack_skip: float = 0.0,
+    first_clip: Optional[str] = None,
+) -> List[Path]:
+    """Reorder clips so each clip's beginning continues the previous clip's end.
+
+    Extracts a short window of frames at both ends of every clip (2 ffmpeg calls
+    per clip, not one per pair), summarizes appearance and motion there, then
+    greedily chains the clips together.
+
+    Args:
+        video_files: Clips, already sorted alphabetically by find_video_files.
+        tmpdir: Scratch directory for extracted frames.
+        sort_window: Seconds of footage to analyse at each clip boundary.
+        haystack_skip: Seconds to ignore at the start of each clip, mirroring
+            the same option in seam matching.
+        first_clip: Substring selecting the opening clip (see
+            ``select_first_clip_index``).
+
+    Returns:
+        The clips in their new order.
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --sort-by-matching-ends. Install with: pip install opencv-python")
+
+    log(f"\n[sort] Ordering {len(video_files)} clips by matching ends "
+        f"(window={sort_window:.2f}s)...")
+
+    # Validated even for a single clip, so a typo'd --first-clip is still caught.
+    first_index = select_first_clip_index(video_files, first_clip)
+
+    if len(video_files) < 2:
+        return list(video_files)
+
+    heads: List[Optional[BoundarySignature]] = []
+    tails: List[Optional[BoundarySignature]] = []
+
+    for video_file in video_files:
+        try:
+            specs = get_video_specs(ffprobe_exe, video_file)
+        except Exception as e:
+            log(f"  WARNING: Could not analyse {video_file.name}: {e}")
+            heads.append(None)
+            tails.append(None)
+            continue
+
+        duration = specs["duration"]
+        fps = specs["fps"] if specs["fps"] > 0 else 30.0
+
+        # Head window: sort_window seconds from haystack_skip, pulled back if
+        # that would run past the end of a very short clip.
+        head_start = min(haystack_skip, max(0.0, duration - sort_window)) if duration > 0 else haystack_skip
+        head_frames = extract_haystack_frames(
+            ffmpeg_exe, video_file, head_start, sort_window, fps, tmpdir,
+            downscale_width=SORT_ANALYSIS_WIDTH,
+        )
+
+        # Tail window: the last sort_window seconds, never reaching back past
+        # the head window's start.
+        if duration > 0:
+            tail_start = max(head_start, duration - sort_window)
+            tail_frames = extract_haystack_frames(
+                ffmpeg_exe, video_file, tail_start, duration - tail_start, fps, tmpdir,
+                downscale_width=SORT_ANALYSIS_WIDTH,
+            )
+        else:
+            log(f"  WARNING: Unknown duration for {video_file.name}; cannot analyse its end")
+            tail_frames = []
+
+        head_sig = summarize_boundary(head_frames, at_end=False)
+        tail_sig = summarize_boundary(tail_frames, at_end=True)
+
+        if head_sig is None:
+            log(f"  WARNING: No frames extracted from the start of {video_file.name}")
+        if tail_sig is None:
+            log(f"  WARNING: No frames extracted from the end of {video_file.name}")
+
+        heads.append(head_sig)
+        tails.append(tail_sig)
+
+    order = order_clips_by_matching_ends(
+        [f.name for f in video_files], tails, heads, first_index
+    )
+    ordered = [video_files[i] for i in order]
+
+    log("[sort] Order chosen (transition score, lower = smoother):")
+    log(f"  1. {ordered[0].name}")
+    for pos in range(1, len(order)):
+        tail = tails[order[pos - 1]]
+        head = heads[order[pos]]
+        if tail is None or head is None:
+            score_desc = "n/a"
+        else:
+            score_desc = f"{score_clip_transition(tail, head):.2f}"
+        log(f"  {pos + 1}. {ordered[pos].name} (score={score_desc})")
+
+    return ordered
 
 
 def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_specs: dict, start_time: float = 0.0, end_time: Optional[float] = None) -> bool:
@@ -889,10 +1260,13 @@ def concatenate_videos(
     video_files: List[Path],
     output_path: Path,
     shuffle: bool = False,
+    sort_by_matching_ends: bool = False,
+    first_clip: Optional[str] = None,
     match_seams: bool = False,
     seed: Optional[int] = None,
     haystack_duration: float = 1.0,
     haystack_skip: float = 0.0,
+    sort_window: float = 0.25,
     output_fps: Optional[float] = None,
 ) -> None:
     """Concatenate video files into one output file.
@@ -900,23 +1274,48 @@ def concatenate_videos(
     Args:
         video_files: List of video files (already sorted alphabetically by find_video_files).
         shuffle: If True, shuffle files into a random order before concatenating.
+            Mutually exclusive with sort_by_matching_ends.
+        sort_by_matching_ends: If True, order clips so each clip's beginning
+            continues the previous clip's end, judging both frame appearance and
+            the direction and speed of motion. Mutually exclusive with shuffle.
+        first_clip: Substring selecting which clip opens the sequence (used only
+            with sort_by_matching_ends; defaults to the alphabetically first clip).
         match_seams: If True, find best matching seam for each pair of adjacent clips by
             simultaneously searching the tail of the preceding clip and the head of the
             successive clip — trimming BOTH the end of the preceding clip and the start
             of the successive clip at the optimal joint.
         seed: Random seed for reproducible shuffling (used only when shuffle=True).
         haystack_duration: Seconds to search at each end for the best seam (used with match_seams).
-        haystack_skip: Seconds to skip at the start of each successive clip before searching (used with match_seams).
+        haystack_skip: Seconds to skip at the start of each successive clip before searching
+            (used with match_seams, and applied to the head window when sort_by_matching_ends).
+        sort_window: Seconds analysed at each clip boundary (used with sort_by_matching_ends).
         output_fps: If set, remux output to this framerate using H264 bitstream method.
+
+    Note:
+        sort_by_matching_ends and match_seams compose: ordering decides which
+        clips adjoin, then seam matching decides where each junction is cut.
     """
     if not video_files:
         raise ValueError("No video files found to concatenate")
 
+    if shuffle and sort_by_matching_ends:
+        raise ValueError("--shuffle and --sort-by-matching-ends cannot be combined: "
+                         "one randomises the order, the other derives it from the footage")
+
+    if first_clip is not None and not sort_by_matching_ends:
+        raise ValueError("--first-clip only applies to --sort-by-matching-ends")
+
     if match_seams and not HAS_OPENCV:
         raise RuntimeError("OpenCV is required for --match-seams. Install with: pip install opencv-python")
 
+    if sort_by_matching_ends and not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --sort-by-matching-ends. Install with: pip install opencv-python")
+
     if match_seams and haystack_duration <= 0:
         raise ValueError("haystack_duration must be positive")
+
+    if sort_by_matching_ends and sort_window <= 0:
+        raise ValueError("sort_window must be positive")
 
     # Determine clip order
     ordered_files = video_files.copy()
@@ -925,10 +1324,26 @@ def concatenate_videos(
             random.seed(seed)
         random.shuffle(ordered_files)
         log(f"\n[shuffle] Shuffled {len(ordered_files)} video files")
+    elif sort_by_matching_ends:
+        # Ordering needs its own scratch space, and must finish before the
+        # target specs below are read from whichever clip ends up first.
+        with tempfile.TemporaryDirectory() as sort_tmpdir:
+            ordered_files = sort_clips_by_matching_ends(
+                ffmpeg_exe,
+                ffprobe_exe,
+                ordered_files,
+                Path(sort_tmpdir),
+                sort_window=sort_window,
+                haystack_skip=haystack_skip,
+                first_clip=first_clip,
+            )
     else:
         log(f"\n[order] Processing {len(ordered_files)} video files in alphabetical order")
-    for i, f in enumerate(ordered_files):
-        log(f"  {i+1}. {f.name}")
+    if not sort_by_matching_ends:
+        # The ordering pass already printed the sequence with its transition
+        # scores; repeating it here would just be the same list twice.
+        for i, f in enumerate(ordered_files):
+            log(f"  {i+1}. {f.name}")
 
     # Get specs from first file
     log(f"\n[specs] Detecting specs from first file: {ordered_files[0].name}")
@@ -1135,6 +1550,11 @@ Example usage:
   python concat_clips.py /path/to/videos output.mp4 --shuffle
   python concat_clips.py /path/to/videos output.mp4 --shuffle --seed 42
 
+  # Order clips so each beginning continues the previous ending
+  python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends
+  python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --first-clip joe123
+  python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --match-seams
+
   # Match seams between clips for smoother transitions
   python concat_clips.py /path/to/videos output.mp4 --match-seams
   python concat_clips.py /path/to/videos output.mp4 --match-seams --haystack-duration 2.0
@@ -1160,6 +1580,17 @@ Example usage:
                     help="Shuffle clips into a random order (default: alphabetical)")
     ap.add_argument("--seed", type=int, default=None,
                     help="Random seed for reproducible shuffling (used with --shuffle)")
+    ap.add_argument("--sort-by-matching-ends", action="store_true",
+                    help="Order clips so each clip's beginning continues the previous clip's end, "
+                         "matching frame appearance and motion direction/speed (requires OpenCV; "
+                         "cannot be combined with --shuffle)")
+    ap.add_argument("--first-clip", type=str, default=None,
+                    help="Substring selecting which clip opens the sequence, e.g. --first-clip joe123 "
+                         "matches joe123-final.mp4 (used with --sort-by-matching-ends; "
+                         "default: alphabetically first)")
+    ap.add_argument("--sort-window", type=float, default=0.25,
+                    help="Seconds analysed at each clip boundary (used with --sort-by-matching-ends, "
+                         "default: 0.25)")
     ap.add_argument("--match-seams", action="store_true",
                     help="Match seams between clips using motion-aware frame comparison (requires OpenCV)")
     ap.add_argument("--haystack-duration", type=float, default=1.0,
@@ -1173,9 +1604,27 @@ Example usage:
 
     args = ap.parse_args()
 
-    # Check OpenCV availability (only required when --match-seams is used)
+    # Validate mutually exclusive ordering modes before doing any real work
+    if args.shuffle and args.sort_by_matching_ends:
+        log("ERROR: --shuffle and --sort-by-matching-ends cannot be combined.")
+        log("One randomises the clip order; the other derives it from the footage.")
+        sys.exit(1)
+
+    if args.first_clip is not None:
+        if not args.sort_by_matching_ends:
+            log("ERROR: --first-clip only applies to --sort-by-matching-ends.")
+            sys.exit(1)
+        if not args.first_clip.strip():
+            log("ERROR: --first-clip requires a non-empty search string")
+            sys.exit(1)
+
+    # Check OpenCV availability (only required when analysing frames)
     if args.match_seams and not HAS_OPENCV:
         log("ERROR: OpenCV is required for --match-seams.")
+        log("Install with: pip install opencv-python")
+        sys.exit(1)
+    if args.sort_by_matching_ends and not HAS_OPENCV:
+        log("ERROR: OpenCV is required for --sort-by-matching-ends.")
         log("Install with: pip install opencv-python")
         sys.exit(1)
 
@@ -1185,6 +1634,9 @@ Example usage:
         sys.exit(1)
     if args.haystack_skip < 0:
         log("ERROR: --haystack-skip must be non-negative")
+        sys.exit(1)
+    if args.sort_window <= 0:
+        log("ERROR: --sort-window must be a positive value")
         sys.exit(1)
 
     # Determine input/output paths
@@ -1243,12 +1695,21 @@ Example usage:
             video_files,
             output_file,
             shuffle=args.shuffle,
+            sort_by_matching_ends=args.sort_by_matching_ends,
+            first_clip=args.first_clip,
             match_seams=args.match_seams,
             seed=args.seed,
             haystack_duration=args.haystack_duration,
             haystack_skip=args.haystack_skip,
+            sort_window=args.sort_window,
             output_fps=args.fps,
         )
+    except ValueError as e:
+        # ValueError is how this module reports bad input (no clips found,
+        # conflicting flags, an unmatched --first-clip). Those are the user's
+        # problem to fix, so report them plainly without a traceback.
+        log(f"\nERROR: {e}")
+        sys.exit(1)
     except Exception as e:
         log(f"\nERROR: {e}")
         import traceback

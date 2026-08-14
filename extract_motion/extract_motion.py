@@ -1,9 +1,15 @@
 #!/usr/bin/env python
 """
-motion_cctv.py — Motion-only clip extraction optimized for security camera footage.
+extract_motion.py — Motion-only clip extraction from any video footage.
+
+Answers "has something actually been moving in the scene for long enough to
+matter?" rather than "did any pixels change?", so it holds up on footage where
+lighting flickers and compression artefacts would defeat frame-difference
+detection.  Defaults are tuned for long, mostly-static recordings such as
+security camera footage, but the tool is not specific to any source.
 
 Detection: OpenCV background subtraction (MOG2) + morphology + sustained-motion gating.
-Cutting: ffmpeg segment extraction with safe defaults for CCTV weird audio codecs.
+Cutting: ffmpeg segment extraction with defaults that tolerate unusual audio codecs.
 
 Outputs:
 - motion_output/<video_stem>/*.mp4 clips
@@ -180,7 +186,7 @@ def fmt_time(t: float) -> str:
     return f"{t:.3f}"
 
 # ---------------------------
-# OpenCV motion detection (CCTV-optimized)
+# OpenCV motion detection (tuned for long, mostly-static footage)
 # ---------------------------
 
 def detect_motion_segments_opencv(
@@ -269,7 +275,7 @@ def detect_motion_segments_opencv(
     if total_frames <= 0:
         total_frames = int(duration_s * fps)
 
-    # Background subtractor tuned for CCTV-ish footage
+    # Background subtractor tuned for long, mostly-static footage
     # history: Number of frames used for background learning. Must be large enough to handle
     # long-duration motion events without absorbing moving objects into the background.
     # With frame_skip=2 and fps=30, history=500 means only 33 seconds of coverage.
@@ -537,7 +543,7 @@ def detect_motion_segments_opencv(
     return final
 
 # ---------------------------
-# Cutting (FFmpeg) with CCTV-safe defaults
+# Cutting (FFmpeg) with defaults that tolerate unusual source streams
 # ---------------------------
 
 def make_clip(
@@ -561,7 +567,8 @@ def make_clip(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg_log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Default: copy video; audio often uses odd codecs in CCTV. Safest is to drop audio.
+    # Default: copy video; audio often uses odd codecs (common in security-camera
+    # recorders). Safest is to drop audio.
     if reencode_video:
         # frame-accurate, slower
         if gpu_encoder:
@@ -685,7 +692,7 @@ def parse_roi(s: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
     return (x, y, w, h)
 
 def main():
-    ap = argparse.ArgumentParser(description="Motion-only clip extraction optimized for security camera footage.")
+    ap = argparse.ArgumentParser(description="Motion-only clip extraction from any video footage.")
     ap.add_argument("input_folder", type=str)
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--recursive", action="store_true")
@@ -710,7 +717,7 @@ def main():
     ap.add_argument("--pad", type=float, default=1.0, help="Padding added before/after each segment.")
 
     # Cutting
-    ap.add_argument("--keep-audio", action="store_true", help="Keep audio (re-encode to AAC if needed). Default drops audio for CCTV compatibility.")
+    ap.add_argument("--keep-audio", action="store_true", help="Keep audio (re-encode to AAC if needed). Default drops audio for broad compatibility.")
     ap.add_argument("--reencode-video", action="store_true", help="Re-encode video (frame-accurate, slower). Default stream-copies video.")
     ap.add_argument("--crf", type=int, default=18)
     ap.add_argument("--preset", type=str, default="veryfast")

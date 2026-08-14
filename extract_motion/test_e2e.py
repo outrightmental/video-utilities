@@ -1,9 +1,9 @@
 #!/usr/bin/env python
 """
-End-to-end test for motion_cctv.py
+End-to-end test for extract_motion.py
 
 Tests that:
-1. motion_cctv.py runs successfully on example footage
+1. extract_motion.py runs successfully on example footage
 2. Exactly one motion clip is produced
 3. The clip starts at approximately 00:30 and ends at approximately 01:30
    (with tolerance to account for actual motion detection in the example footage)
@@ -48,7 +48,7 @@ def get_video_info(video_path):
 
 def main():
     print("=" * 80)
-    print("End-to-End Test for motion_cctv.py")
+    print("End-to-End Test for extract_motion.py")
     print("=" * 80)
     
     # Setup paths
@@ -71,14 +71,14 @@ def main():
         print(f"\nCleaning up existing output: {output_dir}")
         shutil.rmtree(output_dir)
     
-    # Step 1: Run motion_cctv.py with parameters that produce one merged clip
+    # Step 1: Run extract_motion.py with parameters that produce one merged clip
     # The example footage contains motion from approximately 30s to 105s
     # We use --merge-gap 15.0 to merge nearby motion segments into one continuous clip
     # We use --min-duration 50.0 to ensure we get substantial motion events only
-    print("\n[Step 1] Running motion_cctv.py on example footage...")
+    print("\n[Step 1] Running extract_motion.py on example footage...")
     cmd = [
         sys.executable,
-        str(script_dir / "motion_cctv.py"),
+        str(script_dir / "extract_motion.py"),
         str(example_footage),
         "--merge-gap", "15.0",  # Merge segments within 15 seconds
         "--min-duration", "50.0"  # Only keep segments longer than 50 seconds
@@ -86,12 +86,12 @@ def main():
     
     result = run_command(cmd)
     if result.returncode != 0:
-        print(f"❌ FAILED: motion_cctv.py failed with exit code {result.returncode}")
+        print(f"❌ FAILED: extract_motion.py failed with exit code {result.returncode}")
         print(f"STDOUT: {result.stdout}")
         print(f"STDERR: {result.stderr}")
         return 1
     
-    print("✓ motion_cctv.py completed successfully")
+    print("✓ extract_motion.py completed successfully")
     
     # Step 2: Verify output structure
     print("\n[Step 2] Verifying output structure...")
