@@ -2,8 +2,8 @@
 """
 Integration tests for concat_clips.py
 
-Tests motion-aware pair matching concepts and end-to-end concatenation integrity
-using real test footage.
+Tests motion-aware pair matching concepts, clip ordering, and end-to-end
+concatenation integrity using real test footage.
 """
 
 import shutil
@@ -181,8 +181,8 @@ class TestFindBestSeamScoring(unittest.TestCase):
             "Seam during fast motion should have a better (lower) score than a near-static seam")
 
 
-class TestConcatenationIntegrity(unittest.TestCase):
-    """Integration test: concatenate test footage and verify stream integrity with ffprobe."""
+class FootageTestMixin:
+    """Shared setup for tests that run the real script against real footage."""
 
     SCRIPT_DIR = Path(__file__).resolve().parent
     TEST_FOOTAGE_DIR = SCRIPT_DIR / "test_footage"
@@ -213,6 +213,10 @@ class TestConcatenationIntegrity(unittest.TestCase):
             self.skipTest("ffmpeg not found on PATH")
         if not self._has_ffprobe():
             self.skipTest("ffprobe not found on PATH")
+
+
+class TestConcatenationIntegrity(FootageTestMixin, unittest.TestCase):
+    """Integration test: concatenate test footage and verify stream integrity with ffprobe."""
 
     def test_concatenated_output_has_no_stream_errors(self):
         """Run concat_clips on test footage and verify ffprobe reports no warnings."""
@@ -269,6 +273,121 @@ class TestConcatenationIntegrity(unittest.TestCase):
             # Verify we actually got frame data
             frame_lines = [l for l in probe.stdout.splitlines() if l.startswith("frame,")]
             self.assertGreater(len(frame_lines), 0, "ffprobe returned no frame data")
+
+
+class TestSortByMatchingEndsIntegration(FootageTestMixin, unittest.TestCase):
+    """Integration tests for --sort-by-matching-ends against real footage."""
+
+    def _run(self, extra_args, output_path, expect_success=True):
+        """Run concat_clips.py with the given extra arguments."""
+        env = {**subprocess.os.environ, "PYTHONIOENCODING": "utf-8"}
+        cmd = [
+            sys.executable,
+            str(self.SCRIPT_DIR / "concat_clips.py"),
+            str(self.TEST_FOOTAGE_DIR),
+            str(output_path),
+        ] + extra_args
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+        if expect_success:
+            self.assertEqual(result.returncode, 0, f"Script failed:\n{result.stderr}\n{result.stdout}")
+        return result
+
+    @staticmethod
+    def _parse_chosen_order(stdout):
+        """Pull the clip filenames out of the '[sort] Order chosen' block.
+
+        Entries look like "1. name.mp4" or "2. name.mp4 (score=1.23)".  The
+        expected position is tracked so that any following numbered list in the
+        log cannot bleed into the parsed order.
+        """
+        order = []
+        collecting = False
+        for line in stdout.splitlines():
+            if line.startswith("[sort] Order chosen"):
+                collecting = True
+                continue
+            if collecting:
+                stripped = line.strip()
+                prefix = f"{len(order) + 1}. "
+                if not stripped.startswith(prefix):
+                    break
+                order.append(stripped[len(prefix):].split(" (score=")[0])
+        return order
+
+    def test_sorted_output_has_no_stream_errors(self):
+        """--sort-by-matching-ends produces a clean, playable concatenation."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            result = self._run(["--sort-by-matching-ends"], output_path)
+
+            self.assertTrue(output_path.exists(), "Output file was not created")
+            self.assertGreater(output_path.stat().st_size, 1000, "Output file is suspiciously small")
+
+            # Every input clip should appear exactly once in the chosen order.
+            chosen = self._parse_chosen_order(result.stdout)
+            expected = sorted(p.name for p in self.TEST_FOOTAGE_DIR.glob("*.mp4"))
+            self.assertEqual(sorted(chosen), expected,
+                "Ordering must be a permutation of the input clips")
+
+            probe = subprocess.run(
+                ["ffprobe", "-v", "warning", "-select_streams", "v:0", "-show_frames",
+                 "-show_entries", "frame=pkt_pts_time,pict_type,key_frame", "-of", "csv",
+                 str(output_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            warnings = [l.strip() for l in probe.stderr.splitlines()
+                        if l.strip() and "SEI" not in l]
+            self.assertEqual(len(warnings), 0,
+                f"ffprobe reported warning(s) on sorted output:\n" + "\n".join(warnings[:20]))
+
+    def test_first_clip_substring_leads_the_output(self):
+        """--first-clip picks the opening clip by substring, as documented."""
+        self._skip_if_missing()
+
+        mp4s = sorted(p.name for p in self.TEST_FOOTAGE_DIR.glob("*.mp4"))
+        # Choose a clip that is NOT alphabetically first, so the flag has to work.
+        target = mp4s[-1]
+        needle = Path(target).stem
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            result = self._run(["--sort-by-matching-ends", "--first-clip", needle], output_path)
+
+            chosen = self._parse_chosen_order(result.stdout)
+            self.assertTrue(chosen, "Could not parse the chosen order from stdout")
+            self.assertEqual(chosen[0], target,
+                f"--first-clip {needle} should place {target} first, got {chosen[0]}")
+
+    def test_shuffle_and_sort_together_is_rejected(self):
+        """The two ordering modes cannot be combined."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            result = self._run(["--shuffle", "--sort-by-matching-ends"], output_path,
+                               expect_success=False)
+
+            self.assertNotEqual(result.returncode, 0,
+                "Combining --shuffle and --sort-by-matching-ends must fail")
+            self.assertIn("cannot be combined", result.stdout + result.stderr)
+            self.assertFalse(output_path.exists(), "No output should be written on error")
+
+    def test_unmatched_first_clip_is_rejected(self):
+        """An unmatched --first-clip pattern fails loudly instead of guessing."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            result = self._run(
+                ["--sort-by-matching-ends", "--first-clip", "no-such-clip-xyz"],
+                output_path, expect_success=False,
+            )
+
+            self.assertNotEqual(result.returncode, 0,
+                "An unmatched --first-clip pattern must fail")
+            self.assertIn("did not match", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":
