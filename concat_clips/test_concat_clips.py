@@ -3,7 +3,8 @@
 Unit tests for concat_clips.py
 
 Tests the core functions to ensure basic concatenation, shuffle,
-sort-by-matching-ends, and match-seams features work correctly.
+sort-by-matching-ends, sort-by-intensity, and match-seams features work
+correctly.
 """
 
 import inspect
@@ -197,9 +198,7 @@ class TestShuffleMode(unittest.TestCase):
     """Test the --shuffle mode functionality."""
 
     @patch('concat_clips.concat_clips.get_video_specs')
-    @patch('concat_clips.concat_clips.find_best_matching_frame_pair')
-    @patch('concat_clips.concat_clips.get_last_two_frames')
-    def test_shuffle_false_skips_random(self, mock_get_last, mock_find_best, mock_get_specs):
+    def test_shuffle_false_skips_random(self, mock_get_specs):
         """Verify that shuffle=False preserves alphabetical order."""
         mock_get_specs.return_value = {
             'codec': 'h264', 'width': 1920, 'height': 1080,
@@ -218,7 +217,6 @@ class TestShuffleMode(unittest.TestCase):
 
             # Capture the order files are processed by checking log output
             processed_order = []
-            original_get_specs = mock_get_specs.side_effect
 
             def track_order(ffprobe_exe, path):
                 processed_order.append(path.name)

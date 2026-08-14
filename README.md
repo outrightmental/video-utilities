@@ -284,10 +284,17 @@ Like `--sort-by-matching-ends`, it cannot be combined with `--shuffle`, and it c
 
 ### Seam Matching Algorithm (`--match-seams`)
 
-1. Extract the last **2 consecutive frames** of the preceding clip ("needle pair").
-2. Sample pairs of consecutive frames in the first N seconds of the next clip ("haystack").
-3. Pick the pair with the lowest combined MSE — this captures **motion direction** and prevents sudden reversals.
-4. Trim the next clip to start at that best-matching frame.
+Where clip ordering decides which clips adjoin, seam matching decides where each junction is actually cut — searching **both sides** of the seam at once rather than trimming only the incoming clip.
+
+1. For each adjacent pair of clips (A, B), extract frames from the last `--haystack-duration` seconds of A and the first `--haystack-duration` seconds of B.
+2. Score every combination of a consecutive pair from A's tail against a consecutive pair from B's head on three criteria:
+   - **Similarity** — the two junction frames look as alike as possible.
+   - **Direction** — motion continues the same way across the cut instead of reversing.
+   - **Velocity** — the cut lands during fast motion, where artefacts are hardest to notice.
+3. The winning combination sets both the trim *end* of A and the trim *start* of B, with B resuming one frame past the junction so the matched frame is not shown twice.
+4. Every clip is then re-encoded at its determined trim points and concatenated.
+
+Because the cut must be frame-accurate, trimmed clips are re-encoded rather than stream-copied — stream copy can only cut at keyframes, which would defeat the search.
 
 ### Features
 
