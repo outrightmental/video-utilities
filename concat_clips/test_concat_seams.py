@@ -6,6 +6,7 @@ Tests motion-aware pair matching concepts, clip ordering, and end-to-end
 concatenation integrity using real test footage.
 """
 
+import re
 import shutil
 import subprocess
 import sys
@@ -214,6 +215,46 @@ class FootageTestMixin:
         if not self._has_ffprobe():
             self.skipTest("ffprobe not found on PATH")
 
+    # Entries in the chosen-order block look like:
+    #   "1. name.mp4"
+    #   "2. name.mp4 (score=1.23)"
+    #   "1. name.mp4 intensity=4.56"
+    #   "2. name.mp4 (score=1.23, intensity=4.56)"
+    _ORDER_ENTRY = re.compile(
+        r"^(?P<position>\d+)\. (?P<name>.+?)"
+        r"(?: \(score=[^)]*\))?"
+        r"(?: intensity=(?P<intensity>[\d.]+))?$"
+    )
+
+    @classmethod
+    def _parse_chosen_order(cls, stdout, with_intensity=False):
+        """Pull the clips out of the '[sort] Order chosen' block.
+
+        The expected position is tracked so that any following numbered list in
+        the log cannot bleed into the parsed order.
+
+        Returns a list of names, or of (name, intensity) pairs when
+        with_intensity is set (intensity is None if the line carried none).
+        """
+        entries = []
+        collecting = False
+        for line in stdout.splitlines():
+            if line.startswith("[sort] Order chosen"):
+                collecting = True
+                continue
+            if not collecting:
+                continue
+            match = cls._ORDER_ENTRY.match(line.strip())
+            if not match or int(match.group("position")) != len(entries) + 1:
+                break
+            raw = match.group("intensity")
+            intensity = float(raw) if raw is not None else None
+            entries.append((match.group("name"), intensity))
+
+        if with_intensity:
+            return entries
+        return [name for name, _ in entries]
+
 
 class TestConcatenationIntegrity(FootageTestMixin, unittest.TestCase):
     """Integration test: concatenate test footage and verify stream integrity with ffprobe."""
@@ -292,28 +333,6 @@ class TestSortByMatchingEndsIntegration(FootageTestMixin, unittest.TestCase):
             self.assertEqual(result.returncode, 0, f"Script failed:\n{result.stderr}\n{result.stdout}")
         return result
 
-    @staticmethod
-    def _parse_chosen_order(stdout):
-        """Pull the clip filenames out of the '[sort] Order chosen' block.
-
-        Entries look like "1. name.mp4" or "2. name.mp4 (score=1.23)".  The
-        expected position is tracked so that any following numbered list in the
-        log cannot bleed into the parsed order.
-        """
-        order = []
-        collecting = False
-        for line in stdout.splitlines():
-            if line.startswith("[sort] Order chosen"):
-                collecting = True
-                continue
-            if collecting:
-                stripped = line.strip()
-                prefix = f"{len(order) + 1}. "
-                if not stripped.startswith(prefix):
-                    break
-                order.append(stripped[len(prefix):].split(" (score=")[0])
-        return order
-
     def test_sorted_output_has_no_stream_errors(self):
         """--sort-by-matching-ends produces a clean, playable concatenation."""
         self._skip_if_missing()
@@ -388,6 +407,135 @@ class TestSortByMatchingEndsIntegration(FootageTestMixin, unittest.TestCase):
             self.assertNotEqual(result.returncode, 0,
                 "An unmatched --first-clip pattern must fail")
             self.assertIn("did not match", result.stdout + result.stderr)
+
+
+class TestSortByIntensityIntegration(FootageTestMixin, unittest.TestCase):
+    """Integration tests for --sort-by-intensity against real footage."""
+
+    def _run(self, extra_args, output_path, expect_success=True):
+        env = {**subprocess.os.environ, "PYTHONIOENCODING": "utf-8"}
+        cmd = [
+            sys.executable,
+            str(self.SCRIPT_DIR / "concat_clips.py"),
+            str(self.TEST_FOOTAGE_DIR),
+            str(output_path),
+        ] + extra_args
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180, env=env)
+        if expect_success:
+            self.assertEqual(result.returncode, 0, f"Script failed:\n{result.stderr}\n{result.stdout}")
+        return result
+
+    def test_ascending_orders_quietest_to_busiest(self):
+        """--sort-by-intensity puts the least motion first."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            result = self._run(["--sort-by-intensity"], output_path)
+
+            entries = self._parse_chosen_order(result.stdout, with_intensity=True)
+            self.assertTrue(entries, "Could not parse the chosen order from stdout")
+
+            values = [intensity for _, intensity in entries]
+            self.assertTrue(all(v is not None for v in values),
+                "Every clip in a pure intensity sort should report a measurement")
+            self.assertEqual(values, sorted(values),
+                f"Ascending order must be non-decreasing, got {values}")
+
+            self.assertTrue(output_path.exists(), "Output file was not created")
+            self.assertGreater(output_path.stat().st_size, 1000, "Output file is suspiciously small")
+
+    def test_descending_reverses_ascending(self):
+        """--sort-by-intensity desc is the exact mirror of the default."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            asc = self._parse_chosen_order(
+                self._run(["--sort-by-intensity"], Path(tmpdir) / "asc.mp4").stdout)
+            desc = self._parse_chosen_order(
+                self._run(["--sort-by-intensity", "desc"], Path(tmpdir) / "desc.mp4").stdout)
+
+            self.assertTrue(asc and desc, "Could not parse both orders")
+            self.assertEqual(asc, list(reversed(desc)),
+                f"desc should reverse asc:\n  asc={asc}\n  desc={desc}")
+
+    def test_combined_with_matching_ends_opens_on_the_quietest(self):
+        """Layered onto matching-ends, an ascending arc still starts at the bottom."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pure = self._parse_chosen_order(
+                self._run(["--sort-by-intensity"], Path(tmpdir) / "pure.mp4").stdout)
+            combined = self._parse_chosen_order(
+                self._run(["--sort-by-matching-ends", "--sort-by-intensity"],
+                          Path(tmpdir) / "combined.mp4").stdout)
+
+            self.assertTrue(pure and combined, "Could not parse both orders")
+            self.assertEqual(combined[0], pure[0],
+                "The combined ordering should still open on the quietest clip")
+            self.assertEqual(sorted(combined), sorted(pure),
+                "The combined ordering must still be a permutation of the clips")
+
+    def test_explicit_first_clip_overrides_the_intensity_opening(self):
+        """--first-clip wins over the automatic quietest/busiest choice."""
+        self._skip_if_missing()
+
+        mp4s = sorted(p.name for p in self.TEST_FOOTAGE_DIR.glob("*.mp4"))
+        target = mp4s[-1]
+        needle = Path(target).stem
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run(
+                ["--sort-by-matching-ends", "--sort-by-intensity", "--first-clip", needle],
+                Path(tmpdir) / "output.mp4",
+            )
+            chosen = self._parse_chosen_order(result.stdout)
+            self.assertEqual(chosen[0], target,
+                "An explicit --first-clip must beat the intensity-derived opening")
+
+    def test_combined_output_has_no_stream_errors(self):
+        """Both ordering flags together still produce a clean concatenation."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            self._run(["--sort-by-matching-ends", "--sort-by-intensity", "desc", "--match-seams"],
+                      output_path)
+
+            probe = subprocess.run(
+                ["ffprobe", "-v", "warning", "-select_streams", "v:0", "-show_frames",
+                 "-show_entries", "frame=pkt_pts_time,pict_type,key_frame", "-of", "csv",
+                 str(output_path)],
+                capture_output=True, text=True, timeout=60,
+            )
+            warnings = [l.strip() for l in probe.stderr.splitlines()
+                        if l.strip() and "SEI" not in l]
+            self.assertEqual(len(warnings), 0,
+                "ffprobe reported warning(s) on combined output:\n" + "\n".join(warnings[:20]))
+
+    def test_shuffle_and_intensity_together_is_rejected(self):
+        """Randomising and measuring are contradictory ways to pick an order."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            result = self._run(["--shuffle", "--sort-by-intensity"], output_path,
+                               expect_success=False)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cannot be combined", result.stdout + result.stderr)
+            self.assertFalse(output_path.exists(), "No output should be written on error")
+
+    def test_invalid_direction_is_rejected(self):
+        """Anything other than asc/desc fails at argument parsing."""
+        self._skip_if_missing()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "output.mp4"
+            result = self._run(["--sort-by-intensity", "sideways"], output_path,
+                               expect_success=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("invalid choice", result.stdout + result.stderr)
 
 
 if __name__ == "__main__":

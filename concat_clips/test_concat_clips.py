@@ -39,6 +39,10 @@ from concat_clips.concat_clips import (
     concatenate_videos,
     select_first_clip_index,
     order_clips_by_matching_ends,
+    order_clips_by_intensity,
+    select_first_clip_by_intensity,
+    intensity_sort_key,
+    rank_map,
 )
 
 
@@ -182,6 +186,11 @@ class TestConcatenateVideosSignature(unittest.TestCase):
         """Verify that sort_window defaults to 0.25."""
         sig = inspect.signature(concatenate_videos)
         self.assertEqual(sig.parameters['sort_window'].default, 0.25)
+
+    def test_sort_by_intensity_parameter_default(self):
+        """Verify that sort_by_intensity defaults to None (off)."""
+        sig = inspect.signature(concatenate_videos)
+        self.assertIsNone(sig.parameters['sort_by_intensity'].default)
 
 
 class TestShuffleMode(unittest.TestCase):
@@ -764,6 +773,302 @@ class TestSortByMatchingEndsValidation(unittest.TestCase):
             mock_sort.assert_not_called()
 
 
+class TestRankMap(unittest.TestCase):
+    """Test the ranking helper used to blend two orderings."""
+
+    def test_ranks_ascending_by_key(self):
+        """Lowest key gets rank 0."""
+        ranks = rank_map([0, 1, 2], key=lambda i: [5.0, 1.0, 3.0][i])
+        self.assertEqual(ranks, {1: 0, 2: 1, 0: 2})
+
+    def test_ties_share_the_lower_rank(self):
+        """Equally good candidates must not be split by list position."""
+        ranks = rank_map([0, 1, 2], key=lambda i: [2.0, 2.0, 9.0][i])
+        self.assertEqual(ranks[0], ranks[1])
+        self.assertLess(ranks[0], ranks[2])
+
+    def test_all_infinite_keys_tie(self):
+        """When nothing can be scored, every candidate ranks equally."""
+        ranks = rank_map([0, 1, 2], key=lambda i: float('inf'))
+        self.assertEqual(set(ranks.values()), {0})
+
+    def test_empty_input(self):
+        """No items, no ranks."""
+        self.assertEqual(rank_map([], key=lambda i: i), {})
+
+
+class TestIntensitySortKey(unittest.TestCase):
+    """Test the ordering key used for intensity."""
+
+    def test_ascending_puts_quietest_first(self):
+        self.assertLess(intensity_sort_key(1.0, "asc"), intensity_sort_key(9.0, "asc"))
+
+    def test_descending_puts_busiest_first(self):
+        self.assertLess(intensity_sort_key(9.0, "desc"), intensity_sort_key(1.0, "desc"))
+
+    def test_unmeasured_sorts_last_in_both_directions(self):
+        """An unknown intensity never wins a position."""
+        for direction in ("asc", "desc"):
+            self.assertGreater(intensity_sort_key(None, direction),
+                               intensity_sort_key(9999.0, direction))
+            self.assertGreater(intensity_sort_key(None, direction),
+                               intensity_sort_key(0.0, direction))
+
+
+class TestOrderClipsByIntensity(unittest.TestCase):
+    """Test the standalone intensity ordering."""
+
+    def test_ascending_is_quietest_first(self):
+        names = ["a.mp4", "b.mp4", "c.mp4"]
+        order = order_clips_by_intensity(names, [5.0, 1.0, 3.0], "asc")
+        self.assertEqual([names[i] for i in order], ["b.mp4", "c.mp4", "a.mp4"])
+
+    def test_descending_is_busiest_first(self):
+        names = ["a.mp4", "b.mp4", "c.mp4"]
+        order = order_clips_by_intensity(names, [5.0, 1.0, 3.0], "desc")
+        self.assertEqual([names[i] for i in order], ["a.mp4", "c.mp4", "b.mp4"])
+
+    def test_descending_is_exact_mirror_of_ascending(self):
+        """With distinct intensities the two directions are reverses."""
+        names = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]
+        intensities = [5.0, 1.0, 3.0, 8.0]
+        asc = order_clips_by_intensity(names, intensities, "asc")
+        desc = order_clips_by_intensity(names, intensities, "desc")
+        self.assertEqual(asc, list(reversed(desc)))
+
+    def test_unmeasured_clips_go_last(self):
+        """Clips that could not be measured settle at the end, either direction."""
+        names = ["a.mp4", "b.mp4", "c.mp4"]
+        for direction in ("asc", "desc"):
+            order = order_clips_by_intensity(names, [None, 1.0, 3.0], direction)
+            self.assertEqual(names[order[-1]], "a.mp4")
+
+    def test_equal_intensities_tie_break_on_name(self):
+        """Identical intensities fall back to alphabetical, not input order."""
+        names = ["c.mp4", "a.mp4", "b.mp4"]
+        order = order_clips_by_intensity(names, [2.0, 2.0, 2.0], "asc")
+        self.assertEqual([names[i] for i in order], ["a.mp4", "b.mp4", "c.mp4"])
+
+    def test_is_a_permutation(self):
+        names = ["a.mp4", "b.mp4", "c.mp4", "d.mp4"]
+        order = order_clips_by_intensity(names, [5.0, None, 3.0, 8.0], "asc")
+        self.assertEqual(sorted(order), [0, 1, 2, 3])
+
+    def test_invalid_direction_raises(self):
+        with self.assertRaises(ValueError):
+            order_clips_by_intensity(["a.mp4"], [1.0], "sideways")
+
+
+class TestSelectFirstClipByIntensity(unittest.TestCase):
+    """Test which clip opens an intensity arc."""
+
+    def test_ascending_opens_on_quietest(self):
+        """An ascending arc has to start at the bottom to have room to climb."""
+        self.assertEqual(select_first_clip_by_intensity([5.0, 1.0, 3.0], "asc"), 1)
+
+    def test_descending_opens_on_busiest(self):
+        self.assertEqual(select_first_clip_by_intensity([5.0, 1.0, 3.0], "desc"), 0)
+
+    def test_ignores_unmeasured_clips(self):
+        self.assertEqual(select_first_clip_by_intensity([None, 4.0, 2.0], "asc"), 2)
+
+    def test_returns_none_when_nothing_measured(self):
+        """With no measurements there is no basis to choose, and the caller falls back."""
+        self.assertIsNone(select_first_clip_by_intensity([None, None], "asc"))
+
+    def test_ties_pick_the_alphabetically_first(self):
+        """Clips arrive sorted, so the lowest index is the alphabetically first."""
+        for direction in ("asc", "desc"):
+            self.assertEqual(select_first_clip_by_intensity([2.0, 2.0, 2.0], direction), 0)
+
+
+@unittest.skipUnless(HAS_OPENCV, "OpenCV is required for these tests")
+class TestIntensityBlendedOrdering(unittest.TestCase):
+    """Test intensity layered onto matching-ends ordering."""
+
+    def _sigs(self, n):
+        return [BoundarySignature(frame=i, motion=None, speed=0.0) for i in range(n)]
+
+    def _order_with(self, scores_from_start, intensities, direction):
+        """Order 4 clips where every transition score is dictated by a table."""
+        names = ["start.mp4", "x.mp4", "y.mp4", "z.mp4"]
+        tails = self._sigs(4)
+        heads = self._sigs(4)
+
+        def fake_score(tail, head):
+            # Only transitions out of the start clip matter for the first pick.
+            return scores_from_start.get((tail.frame, head.frame), 100.0)
+
+        with patch('concat_clips.concat_clips.score_clip_transition', side_effect=fake_score):
+            return order_clips_by_matching_ends(
+                names, tails, heads, 0,
+                intensities=intensities, intensity_direction=direction,
+            )
+
+    def test_intensity_can_outvote_smoothness(self):
+        """A candidate several ranks better on intensity beats a slightly smoother one.
+
+        Smoothness ranks x(0) < y(1) < z(2); intensity ranks y(0) < z(1) < x(2).
+        Blended, y wins at 1 against x's 2 — so the pick flips from x to y.
+        """
+        scores = {(0, 1): 1.0, (0, 2): 2.0, (0, 3): 3.0}
+        intensities = [0.0, 3.0, 1.0, 2.0]  # start, x=busiest, y=quietest, z=middle
+
+        without = self._order_with(scores, None, None)
+        with_intensity = self._order_with(scores, intensities, "asc")
+
+        self.assertEqual(without[1], 1, "Smoothness alone should pick x")
+        self.assertEqual(with_intensity[1], 2, "Blended with intensity should pick y")
+
+    def test_smoothness_wins_an_exact_rank_tie(self):
+        """When the two rankings are exactly opposed, the smoother cut decides."""
+        scores = {(0, 1): 1.0, (0, 2): 2.0, (0, 3): 3.0}
+        # Intensity exactly reverses the smoothness order, so every blend ties.
+        intensities = [0.0, 3.0, 2.0, 1.0]
+
+        order = self._order_with(scores, intensities, "asc")
+        self.assertEqual(order[1], 1, "A tie on blended rank should fall to the smoother cut")
+
+    def test_direction_reverses_the_preference(self):
+        """Flipping asc to desc flips which candidate the intensity term favours."""
+        scores = {(0, 1): 1.0, (0, 2): 1.0, (0, 3): 1.0}  # smoothness is neutral
+        intensities = [5.0, 9.0, 1.0, 5.0]
+
+        asc = self._order_with(scores, intensities, "asc")
+        desc = self._order_with(scores, intensities, "desc")
+
+        self.assertEqual(asc[1], 2, "Ascending should pick the quietest candidate")
+        self.assertEqual(desc[1], 1, "Descending should pick the busiest candidate")
+
+    def test_absent_intensity_leaves_ordering_untouched(self):
+        """Passing no intensities is exactly the old behaviour."""
+        scores = {(0, 1): 3.0, (0, 2): 1.0, (0, 3): 2.0}
+        self.assertEqual(self._order_with(scores, None, None)[1], 2)
+
+    def test_unmeasured_intensities_do_not_crash(self):
+        """A clip with no measurement still gets ordered, just never preferred."""
+        scores = {(0, 1): 1.0, (0, 2): 2.0, (0, 3): 3.0}
+        order = self._order_with(scores, [1.0, None, None, 2.0], "asc")
+        self.assertEqual(sorted(order), [0, 1, 2, 3])
+
+
+class TestSortByIntensityValidation(unittest.TestCase):
+    """Test the guard rails around --sort-by-intensity."""
+
+    def _one_fake_video(self, tmpdir_path):
+        fake = tmpdir_path / "test.mp4"
+        fake.write_bytes(b'\x00\x00\x00\x00')
+        return fake
+
+    def test_shuffle_and_intensity_together_raises(self):
+        """--shuffle and --sort-by-intensity are mutually exclusive."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            with self.assertRaises(ValueError) as ctx:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[self._one_fake_video(tmpdir_path)],
+                    output_path=tmpdir_path / "output.mp4",
+                    shuffle=True,
+                    sort_by_intensity="asc",
+                )
+            self.assertIn("cannot be combined", str(ctx.exception))
+
+    def test_invalid_direction_raises(self):
+        """Only asc and desc are accepted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            with self.assertRaises(ValueError) as ctx:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[self._one_fake_video(tmpdir_path)],
+                    output_path=tmpdir_path / "output.mp4",
+                    sort_by_intensity="sideways",
+                )
+            self.assertIn("asc", str(ctx.exception))
+
+    @patch('concat_clips.concat_clips.HAS_OPENCV', False)
+    def test_intensity_without_opencv_raises(self):
+        """Measuring motion needs OpenCV and says so."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            with self.assertRaises(RuntimeError) as ctx:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[self._one_fake_video(tmpdir_path)],
+                    output_path=tmpdir_path / "output.mp4",
+                    sort_by_intensity="asc",
+                )
+            self.assertIn("OpenCV", str(ctx.exception))
+
+    @patch('concat_clips.concat_clips.HAS_OPENCV', True)
+    @patch('concat_clips.concat_clips.get_video_specs')
+    @patch('concat_clips.concat_clips.sort_clips_by_intensity')
+    def test_standalone_intensity_uses_its_own_sort(self, mock_sort, mock_get_specs):
+        """Without --sort-by-matching-ends, intensity orders the clips outright."""
+        mock_get_specs.return_value = {
+            'codec': 'h264', 'width': 1920, 'height': 1080,
+            'fps': 30.0, 'duration': 10.0
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            first = tmpdir_path / "a_video.mp4"
+            first.write_bytes(b'\x00\x00\x00\x00')
+            second = tmpdir_path / "b_video.mp4"
+            second.write_bytes(b'\x00\x00\x00\x00')
+            mock_sort.return_value = [second, first]
+
+            try:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[first, second],
+                    output_path=tmpdir_path / "output.mp4",
+                    sort_by_intensity="desc",
+                )
+            except Exception:
+                pass
+
+            self.assertTrue(mock_sort.called)
+            self.assertEqual(mock_sort.call_args.kwargs.get("direction"), "desc")
+
+    @patch('concat_clips.concat_clips.HAS_OPENCV', True)
+    @patch('concat_clips.concat_clips.get_video_specs')
+    @patch('concat_clips.concat_clips.sort_clips_by_intensity')
+    @patch('concat_clips.concat_clips.sort_clips_by_matching_ends')
+    def test_combined_defers_to_matching_ends(self, mock_matching, mock_intensity, mock_get_specs):
+        """With both flags, ordering runs once — through matching-ends, carrying the direction."""
+        mock_get_specs.return_value = {
+            'codec': 'h264', 'width': 1920, 'height': 1080,
+            'fps': 30.0, 'duration': 10.0
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake = self._one_fake_video(tmpdir_path)
+            mock_matching.return_value = [fake]
+
+            try:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[fake],
+                    output_path=tmpdir_path / "output.mp4",
+                    sort_by_matching_ends=True,
+                    sort_by_intensity="asc",
+                )
+            except Exception:
+                pass
+
+            self.assertTrue(mock_matching.called)
+            self.assertEqual(mock_matching.call_args.kwargs.get("intensity_direction"), "asc")
+            mock_intensity.assert_not_called()
+
+
 @unittest.skipUnless(HAS_OPENCV, "OpenCV is required for these tests")
 class TestPreprocessDownscale(unittest.TestCase):
     """Test the downscaling used by the ordering pass."""
@@ -824,6 +1129,17 @@ class TestDocumentation(unittest.TestCase):
         """Verify the ordering algorithm description covers motion direction."""
         from concat_clips.concat_clips import __doc__ as module_doc
         self.assertIn("direction", module_doc.lower())
+
+    def test_module_mentions_sort_by_intensity(self):
+        """Verify the docstring mentions --sort-by-intensity."""
+        from concat_clips.concat_clips import __doc__ as module_doc
+        self.assertIn("--sort-by-intensity", module_doc)
+
+    def test_module_documents_both_intensity_directions(self):
+        """Verify both ordering directions are documented."""
+        from concat_clips.concat_clips import __doc__ as module_doc
+        self.assertIn("asc", module_doc)
+        self.assertIn("desc", module_doc)
 
 
 if __name__ == "__main__":
