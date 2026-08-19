@@ -179,7 +179,7 @@ Requires example footage in `example_footage/`. The test is skipped when footage
 
 **Location:** [`concat_clips/`](concat_clips/)
 
-Concatenate all video files in a directory into a single output file. Clips are sorted **alphabetically by filename** by default. Optional flags choose a different ordering (`--shuffle`, `--sort-by-matching-ends`, `--sort-by-intensity`) and smooth the transitions between clips (`--match-seams`).
+Concatenate all video files in a directory into a single output file. Clips are sorted **alphabetically by filename** by default. Optional flags choose a different ordering (`--shuffle`, `--sort-by-matching-ends`, `--sort-by-intensity`), smooth the transitions between clips (`--match-seams`), and burn each clip's filename into the output for review (`--review`).
 
 ### Basic Usage
 
@@ -213,6 +213,9 @@ python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-intensi
 
 # Smooth transitions that also build in energy across the sequence
 python concat_clips/concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --sort-by-intensity
+
+# Burn each clip's filename into the output, for reviewing which clips to delete
+python concat_clips/concat_clips.py /path/to/videos output.mp4 --review
 ```
 
 Automatic output naming:
@@ -233,6 +236,7 @@ python concat_clips/concat_clips.py --folder /path/to/videos
 | `--sort-window` | Seconds analysed at each clip boundary (used with `--sort-by-matching-ends`, default: 0.25) |
 | `--sort-by-intensity` | Take each clip's overall amount of motion into account, `asc` (default) or `desc` (requires OpenCV; cannot be combined with `--shuffle`) |
 | `--match-seams` | Match seams between clips using motion-aware frame comparison (requires OpenCV) |
+| `--review` | Burn each clip's filename into its stretch of the output so a reviewer knows which source clips to delete before the next run (requires OpenCV; forces a re-encode of every clip) |
 | `--haystack-duration` | Seconds to search for best match (used with `--match-seams`, default: 1.0) |
 | `--haystack-skip` | Seconds to skip at start of each clip before searching (default: 0.0) |
 | `--folder` | Input folder; output saved as `<folder>.mp4` |
@@ -296,6 +300,12 @@ Where clip ordering decides which clips adjoin, seam matching decides where each
 
 Because the cut must be frame-accurate, trimmed clips are re-encoded rather than stream-copied — stream copy can only cut at keyframes, which would defeat the search.
 
+### Review Mode (`--review`)
+
+Burns each clip's filename into the bottom-left corner of its own stretch of the output — white text on a semi-transparent box — so someone reviewing the footage knows exactly which source clips to delete before the next concat run.
+
+The label is rendered with OpenCV and composited with ffmpeg's core `overlay` filter, so it works on ffmpeg builds that lack the `drawtext` filter (Homebrew's, for one). It composes with every ordering flag and with `--match-seams`. Because the label must be burned into the frames, every clip is re-encoded — including clips that would otherwise be used untouched.
+
 ### Features
 
 - Alphabetical sort by filename (default)
@@ -303,6 +313,7 @@ Because the cut must be frame-accurate, trimmed clips are re-encoded rather than
 - Motion-aware clip ordering from the footage itself (`--sort-by-matching-ends`, `--first-clip`)
 - Ordering by how much motion each clip contains, alone or blended with the above (`--sort-by-intensity`)
 - Motion-aware seam matching for smooth transitions (`--match-seams`)
+- Burned-in clip-name labels for reviewing which clips to delete (`--review`)
 - Recursive scanning across subdirectories (default)
 - Auto-detects codec, resolution, and framerate from the first clip
 - Smart re-encoding for clips that don't match

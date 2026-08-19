@@ -538,5 +538,81 @@ class TestSortByIntensityIntegration(FootageTestMixin, unittest.TestCase):
             self.assertIn("invalid choice", result.stdout + result.stderr)
 
 
+@unittest.skipUnless(HAS_OPENCV, "OpenCV is required for these tests")
+class TestReviewModeIntegration(FootageTestMixin, unittest.TestCase):
+    """Integration tests for --review against real footage."""
+
+    def _run(self, output_path, extra_args):
+        env = {**subprocess.os.environ, "PYTHONIOENCODING": "utf-8"}
+        cmd = [
+            sys.executable,
+            str(self.SCRIPT_DIR / "concat_clips.py"),
+            str(self.TEST_FOOTAGE_DIR),
+            str(output_path),
+        ] + extra_args
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(result.returncode, 0, f"Script failed:\n{result.stdout}\n{result.stderr}")
+        self.assertTrue(output_path.exists(), "Output file was not created")
+        return result
+
+    @staticmethod
+    def _first_frame(path):
+        capture = cv2.VideoCapture(str(path))
+        try:
+            ok, frame = capture.read()
+        finally:
+            capture.release()
+        return frame if ok else None
+
+    def test_review_burns_a_visible_label_into_the_output(self):
+        """The exact region where the label goes differs from an unlabelled run.
+
+        Both runs use the default alphabetical order, so frame N of one output
+        shows the same source frame as frame N of the other; the only intended
+        difference is the burned-in label.  The comparison is confined to the
+        label's own bounding box (recomputed from the real output size), with a
+        same-sized box in the opposite corner as a control for re-encode noise.
+        """
+        self._skip_if_missing()
+
+        from concat_clips.concat_clips import render_review_label, review_label_margin
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            plain_path = tmpdir_path / "plain.mp4"
+            review_path = tmpdir_path / "review.mp4"
+
+            self._run(plain_path, [])
+            self._run(review_path, ["--review"])
+
+            plain_frame = self._first_frame(plain_path)
+            review_frame = self._first_frame(review_path)
+            self.assertIsNotNone(plain_frame, "Could not decode the plain output")
+            self.assertIsNotNone(review_frame, "Could not decode the review output")
+            self.assertEqual(plain_frame.shape, review_frame.shape)
+
+            # Reconstruct the label's bounding box for the first (alphabetical) clip.
+            height, width = plain_frame.shape[:2]
+            first_clip = sorted(self.TEST_FOOTAGE_DIR.glob("*.mp4"))[0]
+            label_png = tmpdir_path / "expected_label.png"
+            specs = {"width": width, "height": height}
+            self.assertTrue(render_review_label(first_clip.name, specs, label_png))
+            label = cv2.imread(str(label_png), cv2.IMREAD_UNCHANGED)
+            label_h, label_w = label.shape[:2]
+            margin = review_label_margin(height)
+
+            diff = np.abs(plain_frame.astype(np.float64) - review_frame.astype(np.float64))
+            label_box = diff[height - margin - label_h:height - margin,
+                             margin:margin + label_w]
+            control_box = diff[margin:margin + label_h,
+                               width - margin - label_w:width - margin]
+
+            self.assertGreater(
+                label_box.mean(), max(5.0, 3.0 * control_box.mean()),
+                "The label region does not differ from the unlabelled run — "
+                "no label appears to have been burned in",
+            )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

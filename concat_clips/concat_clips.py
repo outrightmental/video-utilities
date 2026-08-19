@@ -11,6 +11,7 @@ Usage:
     python concat_clips.py /path/to/videos output.mp4 --sort-by-matching-ends --sort-by-intensity desc
     python concat_clips.py /path/to/videos output.mp4 --match-seams
     python concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams
+    python concat_clips.py /path/to/videos output.mp4 --review
     python concat_clips.py --folder /path/to/videos
 
 Features:
@@ -22,6 +23,9 @@ Features:
 - Optionally takes each clip's overall amount of motion into account
   (--sort-by-intensity), either as the ordering itself or as a bias on it
 - Optionally matches seams between clips using motion-aware frame comparison (--match-seams)
+- Optionally burns each clip's filename into its stretch of the output
+  (--review), so a reviewer can note which source clips to delete before the
+  next concat run
 - Preserves video specs (codec, resolution, framerate) from the first clip
 - Re-encodes non-conformant clips to match the first clip's specs
 - Concatenates all clips using FFmpeg concat demuxer
@@ -73,9 +77,20 @@ Seam Matching Algorithm (--match-seams):
 4. All clips are then re-encoded with their determined trim points and
    concatenated.
 
+Review Mode (--review):
+Each clip's filename is drawn in the bottom-left corner of its own stretch of
+the output, white on a semi-transparent black box, so someone reviewing the
+footage knows exactly which source clips to delete before the next concat run.
+The label is rendered with OpenCV and composited with ffmpeg's core overlay
+filter, so it works on ffmpeg builds without the drawtext filter (Homebrew's,
+for one).  Composes with every ordering flag and with --match-seams.  Because
+the label must be burned into the frames, every clip is re-encoded — including
+clips that would otherwise be used untouched.
+
 Requires:
 - ffmpeg + ffprobe (on PATH or pass --ffmpeg/--ffprobe)
-- OpenCV (pip install opencv-python) — only required when using --match-seams
+- OpenCV (pip install opencv-python) — required by --match-seams,
+  --sort-by-matching-ends, --sort-by-intensity, and --review
 """
 
 import argparse
@@ -1079,8 +1094,73 @@ def sort_clips_by_intensity(
     return ordered
 
 
-def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_specs: dict, start_time: float = 0.0, end_time: Optional[float] = None) -> bool:
-    """Re-encode video to match target specs, optionally starting/ending at specific times."""
+# ---------------------------
+# Review labels (used by --review)
+# ---------------------------
+
+def review_label_margin(height: int) -> int:
+    """Distance in pixels from the frame's bottom-left corner to the label."""
+    return max(8, height // 36)
+
+
+def render_review_label(label: str, target_specs: dict, out_path: Path) -> bool:
+    """Render a clip's name as a white-on-black PNG to overlay on its footage.
+
+    Drawn with OpenCV's built-in Hershey font rather than ffmpeg's drawtext
+    filter, which some ffmpeg builds omit along with libfreetype (Homebrew's,
+    for one).  The backing box is semi-transparent so footage stays visible
+    behind it, and the text height tracks the output resolution.
+
+    Returns:
+        True when the PNG was written, False when rendering failed.
+    """
+    if not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --review. Install with: pip install opencv-python")
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    text_height = max(16, target_specs["height"] // 24)
+    thickness = max(1, text_height // 12)
+    font_scale = cv2.getFontScaleFromHeight(font, text_height, thickness)
+    (text_width, _), baseline = cv2.getTextSize(label, font, font_scale, thickness)
+    pad = max(4, text_height // 3)
+
+    image = np.zeros((text_height + baseline + 2 * pad, text_width + 2 * pad, 4), dtype=np.uint8)
+    image[:, :, 3] = 128  # semi-transparent black backing box
+    cv2.putText(image, label, (pad, pad + text_height), font, font_scale,
+                (255, 255, 255, 255), thickness, cv2.LINE_AA)
+
+    # A very long filename could overrun the frame; shrink it to fit instead.
+    max_width = target_specs["width"] - 2 * review_label_margin(target_specs["height"])
+    if 0 < max_width < image.shape[1]:
+        scale = max_width / image.shape[1]
+        image = cv2.resize(image, (max_width, max(1, int(image.shape[0] * scale))),
+                           interpolation=cv2.INTER_AREA)
+
+    return bool(cv2.imwrite(str(out_path), image))
+
+
+def label_overlay_args(target_specs: dict) -> List[str]:
+    """Output arguments that scale the video and pin a label input onto it.
+
+    Replaces the plain ``-s`` used when no label is burned in: scaling must
+    happen before the overlay so the label's size is relative to the output
+    resolution rather than the source.  Expects the label image as the
+    command's second input; the single PNG frame persists for the whole clip
+    (overlay's default eof_action is repeat).
+    """
+    width, height = target_specs["width"], target_specs["height"]
+    margin = review_label_margin(height)
+    graph = (f"[0:v]scale={width}:{height}[base];"
+             f"[base][1:v]overlay={margin}:main_h-overlay_h-{margin}[labelled]")
+    return ["-filter_complex", graph, "-map", "[labelled]", "-map", "0:a:0?"]
+
+
+def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_specs: dict, start_time: float = 0.0, end_time: Optional[float] = None, label_image: Optional[Path] = None) -> bool:
+    """Re-encode video to match target specs, optionally starting/ending at specific times.
+
+    When label_image is given, it is overlaid on the bottom-left corner of
+    every frame (see --review).
+    """
     end_desc = f", end={end_time:.3f}s" if end_time is not None else ""
     log(f"  Re-encoding {input_path.name} (start={start_time:.3f}s{end_desc})...")
 
@@ -1089,6 +1169,8 @@ def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_
         "-ss", str(start_time),
         "-i", str(input_path),
     ]
+    if label_image is not None:
+        cmd.extend(["-i", str(label_image)])
     if end_time is not None:
         cmd.extend(["-t", str(end_time - start_time)])
     cmd.extend([
@@ -1097,7 +1179,12 @@ def reencode_video(ffmpeg_exe: str, input_path: Path, output_path: Path, target_
         "-crf", "23",
         "-pix_fmt", "yuv420p",
         "-profile:v", "high",
-        "-s", f"{target_specs['width']}x{target_specs['height']}",
+    ])
+    if label_image is not None:
+        cmd.extend(label_overlay_args(target_specs))
+    else:
+        cmd.extend(["-s", f"{target_specs['width']}x{target_specs['height']}"])
+    cmd.extend([
         "-r", str(target_specs['fps']),
         "-c:a", "aac",
         "-b:a", "128k",
@@ -1140,7 +1227,7 @@ def trim_video_streamcopy(ffmpeg_exe: str, input_path: Path, output_path: Path, 
     return True
 
 
-def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict, end_time: Optional[float] = None) -> bool:
+def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, start_time: float, target_specs: dict, end_time: Optional[float] = None, label_image: Optional[Path] = None) -> bool:
     """Trim video with frame-accurate seeking by near-lossless re-encoding.
 
     Stream copy (-c copy) can only cut at keyframes, which means the actual cut
@@ -1151,6 +1238,9 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
     yuv420p pixel format for broad decoder compatibility including Windows
     Media Foundation (Photos app).  CRF 0 is avoided because it forces the
     High 4:4:4 Predictive profile which Windows cannot decode.
+
+    When label_image is given, it is overlaid on the bottom-left corner of
+    every frame (see --review).
     """
     end_desc = f" to {end_time:.3f}s" if end_time is not None else ""
     log(f"  Trimming {input_path.name} from {start_time:.3f}s{end_desc} (near-lossless re-encode for frame-accurate cut)...")
@@ -1160,6 +1250,8 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
         "-ss", str(start_time),
         "-i", str(input_path),
     ]
+    if label_image is not None:
+        cmd.extend(["-i", str(label_image)])
     if end_time is not None:
         cmd.extend(["-t", str(end_time - start_time)])
     cmd.extend([
@@ -1168,7 +1260,12 @@ def trim_video_reencode(ffmpeg_exe: str, input_path: Path, output_path: Path, st
         "-crf", "1",
         "-pix_fmt", "yuv420p",
         "-profile:v", "high",
-        "-s", f"{target_specs['width']}x{target_specs['height']}",
+    ])
+    if label_image is not None:
+        cmd.extend(label_overlay_args(target_specs))
+    else:
+        cmd.extend(["-s", f"{target_specs['width']}x{target_specs['height']}"])
+    cmd.extend([
         "-r", str(target_specs['fps']),
         "-c:a", "aac",
         "-b:a", "320k",
@@ -1282,6 +1379,7 @@ def concatenate_videos(
     sort_by_intensity: Optional[str] = None,
     first_clip: Optional[str] = None,
     match_seams: bool = False,
+    review: bool = False,
     seed: Optional[int] = None,
     haystack_duration: float = 1.0,
     haystack_skip: float = 0.0,
@@ -1309,6 +1407,10 @@ def concatenate_videos(
             simultaneously searching the tail of the preceding clip and the head of the
             successive clip — trimming BOTH the end of the preceding clip and the start
             of the successive clip at the optimal joint.
+        review: If True, burn each clip's filename into its stretch of the
+            output so a reviewer can note which source clips to delete before
+            the next run. Forces a re-encode of every clip, since the label
+            must be baked into the frames.
         seed: Random seed for reproducible shuffling (used only when shuffle=True).
         haystack_duration: Seconds to search at each end for the best seam (used with match_seams).
         haystack_skip: Seconds to skip at the start of each successive clip before searching
@@ -1345,6 +1447,9 @@ def concatenate_videos(
 
     if sort_by_intensity and not HAS_OPENCV:
         raise RuntimeError("OpenCV is required for --sort-by-intensity. Install with: pip install opencv-python")
+
+    if review and not HAS_OPENCV:
+        raise RuntimeError("OpenCV is required for --review. Install with: pip install opencv-python")
 
     if match_seams and haystack_duration <= 0:
         raise ValueError("haystack_duration must be positive")
@@ -1469,6 +1574,18 @@ def concatenate_videos(
         # Phase 2: Process every clip with its determined trim points.
         # ------------------------------------------------------------------
 
+        # In review mode each clip carries a label image with its own filename,
+        # burned in during the re-encode below.
+        review_labels: List[Optional[Path]] = [None] * N
+        if review:
+            log(f"\n[review] Rendering clip-name labels for {N} clips...")
+            for i, video_file in enumerate(ordered_files):
+                label_path = tmpdir_path / f"label_{i:04d}.png"
+                if render_review_label(video_file.name, target_specs, label_path):
+                    review_labels[i] = label_path
+                else:
+                    log(f"  WARNING: Could not render label for {video_file.name}; it will be unlabelled")
+
         processed_files = []
 
         for i, video_file in enumerate(ordered_files):
@@ -1481,13 +1598,15 @@ def concatenate_videos(
 
             trim_start = trim_starts[i]
             trim_end = trim_ends[i]
+            label_image = review_labels[i]
 
             temp_output = tmpdir_path / f"processed_{i:04d}.mp4"
             needs_reencode = not specs_match(target_specs, file_specs)
 
             if needs_reencode:
                 log(f"  Specs differ: {file_specs['width']}x{file_specs['height']} @ {file_specs['fps']:.2f} fps")
-                if reencode_video(ffmpeg_exe, video_file, temp_output, target_specs, trim_start, trim_end):
+                if reencode_video(ffmpeg_exe, video_file, temp_output, target_specs, trim_start, trim_end,
+                                  label_image=label_image):
                     processed_files.append(temp_output)
                 else:
                     log(f"  WARNING: Skipping file due to re-encoding failure")
@@ -1495,10 +1614,13 @@ def concatenate_videos(
             elif trim_start > 0 or trim_end is not None:
                 # Need to trim — re-encode for frame-accurate cuts.
                 # Stream copy can only cut at keyframes, which defeats seam matching.
-                if trim_video_reencode(ffmpeg_exe, video_file, temp_output, trim_start, target_specs, trim_end):
+                if trim_video_reencode(ffmpeg_exe, video_file, temp_output, trim_start, target_specs, trim_end,
+                                       label_image=label_image):
                     processed_files.append(temp_output)
                 else:
                     log(f"  WARNING: Frame-accurate trim failed, falling back to stream copy")
+                    if label_image is not None:
+                        log(f"  WARNING: Stream copy cannot burn the review label; this clip will be unlabelled")
                     if trim_video_streamcopy(ffmpeg_exe, video_file, temp_output, trim_start):
                         processed_files.append(temp_output)
                     else:
@@ -1512,10 +1634,21 @@ def concatenate_videos(
                     # encoding (which may use B-frames, different SPS/PPS) with
                     # re-encoded trimmed clips, producing broken output.
                     log(f"  Re-encoding for codec consistency (no trimming, lossless)...")
-                    if trim_video_reencode(ffmpeg_exe, video_file, temp_output, 0.0, target_specs):
+                    if trim_video_reencode(ffmpeg_exe, video_file, temp_output, 0.0, target_specs,
+                                           label_image=label_image):
                         processed_files.append(temp_output)
                     else:
                         log(f"  WARNING: Re-encoding for consistency failed, using original file")
+                        processed_files.append(video_file)
+                elif label_image is not None:
+                    # The label has to live in the frames themselves, so review
+                    # mode re-encodes even a clip that could be used untouched.
+                    log(f"  Re-encoding to burn review label...")
+                    if reencode_video(ffmpeg_exe, video_file, temp_output, target_specs,
+                                      label_image=label_image):
+                        processed_files.append(temp_output)
+                    else:
+                        log(f"  WARNING: Review re-encode failed, using original file (unlabelled)")
                         processed_files.append(video_file)
                 else:
                     log(f"  Specs match, using original file")
@@ -1611,6 +1744,9 @@ Example usage:
   python concat_clips.py /path/to/videos output.mp4 --match-seams
   python concat_clips.py /path/to/videos output.mp4 --match-seams --haystack-duration 2.0
 
+  # Burn each clip's filename into the output, for reviewing which clips to delete
+  python concat_clips.py /path/to/videos output.mp4 --review
+
   # Shuffle and match seams together
   python concat_clips.py /path/to/videos output.mp4 --shuffle --match-seams --seed 42
 
@@ -1651,6 +1787,10 @@ Example usage:
                          "default: 0.25)")
     ap.add_argument("--match-seams", action="store_true",
                     help="Match seams between clips using motion-aware frame comparison (requires OpenCV)")
+    ap.add_argument("--review", action="store_true",
+                    help="Burn each clip's filename into its stretch of the output so a reviewer "
+                         "knows which source clips to delete before the next run (requires OpenCV; "
+                         "forces a re-encode of every clip)")
     ap.add_argument("--haystack-duration", type=float, default=1.0,
                     help="Seconds to search for best matching frame (used with --match-seams, default: 1.0)")
     ap.add_argument("--haystack-skip", type=float, default=0.0,
@@ -1692,6 +1832,10 @@ Example usage:
         sys.exit(1)
     if args.sort_by_intensity and not HAS_OPENCV:
         log("ERROR: OpenCV is required for --sort-by-intensity.")
+        log("Install with: pip install opencv-python")
+        sys.exit(1)
+    if args.review and not HAS_OPENCV:
+        log("ERROR: OpenCV is required for --review.")
         log("Install with: pip install opencv-python")
         sys.exit(1)
 
@@ -1766,6 +1910,7 @@ Example usage:
             sort_by_intensity=args.sort_by_intensity,
             first_clip=args.first_clip,
             match_seams=args.match_seams,
+            review=args.review,
             seed=args.seed,
             haystack_duration=args.haystack_duration,
             haystack_skip=args.haystack_skip,
