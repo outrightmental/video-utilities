@@ -44,6 +44,9 @@ from concat_clips.concat_clips import (
     select_first_clip_by_intensity,
     intensity_sort_key,
     rank_map,
+    render_review_label,
+    label_overlay_args,
+    review_label_margin,
 )
 
 
@@ -192,6 +195,11 @@ class TestConcatenateVideosSignature(unittest.TestCase):
         """Verify that sort_by_intensity defaults to None (off)."""
         sig = inspect.signature(concatenate_videos)
         self.assertIsNone(sig.parameters['sort_by_intensity'].default)
+
+    def test_review_parameter_default(self):
+        """Verify that review defaults to False."""
+        sig = inspect.signature(concatenate_videos)
+        self.assertEqual(sig.parameters['review'].default, False)
 
 
 class TestShuffleMode(unittest.TestCase):
@@ -1090,6 +1098,155 @@ class TestPreprocessDownscale(unittest.TestCase):
         self.assertEqual(result.shape, (200, 400))
 
 
+@unittest.skipUnless(HAS_OPENCV, "OpenCV is required for these tests")
+class TestRenderReviewLabel(unittest.TestCase):
+    """Test the label images burned in by --review."""
+
+    SPECS = {'codec': 'h264', 'width': 1920, 'height': 1080, 'fps': 30.0, 'duration': 10.0}
+
+    def _render(self, label, specs):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out = Path(tmpdir) / "label.png"
+            self.assertTrue(render_review_label(label, specs, out))
+            image = cv2.imread(str(out), cv2.IMREAD_UNCHANGED)
+            self.assertIsNotNone(image)
+            return image
+
+    def test_renders_text_on_a_translucent_box(self):
+        """The PNG keeps its alpha channel and contains bright text pixels."""
+        image = self._render("clip_001.mp4", self.SPECS)
+        self.assertEqual(image.shape[2], 4, "Label must carry an alpha channel")
+        self.assertTrue((image[:, :, :3] > 200).any(), "No bright text pixels found")
+        # The backing box is translucent, not opaque: footage stays visible.
+        self.assertTrue((image[:, :, 3] < 255).any(), "Backing box should be semi-transparent")
+
+    def test_label_scales_with_output_height(self):
+        """A 4K output gets a proportionally bigger label than a 480p one."""
+        big = self._render("clip.mp4", dict(self.SPECS, height=2160))
+        small = self._render("clip.mp4", dict(self.SPECS, height=480))
+        self.assertGreater(big.shape[0], small.shape[0])
+        self.assertGreater(big.shape[1], small.shape[1])
+
+    def test_long_names_are_shrunk_to_fit_the_frame(self):
+        """A filename longer than the frame is scaled down, not cut off."""
+        long_name = "a" * 300 + ".mp4"
+        image = self._render(long_name, dict(self.SPECS, width=640, height=480))
+        self.assertLessEqual(image.shape[1], 640 - 2 * review_label_margin(480))
+
+
+class TestLabelOverlayArgs(unittest.TestCase):
+    """Test the ffmpeg arguments that composite a label onto a clip."""
+
+    SPECS = {'codec': 'h264', 'width': 1920, 'height': 1080, 'fps': 30.0, 'duration': 10.0}
+
+    def _graph(self):
+        args = label_overlay_args(self.SPECS)
+        return args[args.index("-filter_complex") + 1]
+
+    def test_scales_before_overlaying(self):
+        """The label lands on the output resolution, not the source's."""
+        graph = self._graph()
+        self.assertIn("scale=1920:1080", graph)
+        self.assertLess(graph.index("scale="), graph.index("overlay="))
+
+    def test_pins_label_to_the_bottom_left(self):
+        """The overlay position leaves the configured margin at left and bottom."""
+        margin = review_label_margin(1080)
+        self.assertIn(f"overlay={margin}:main_h-overlay_h-{margin}", self._graph())
+
+    def test_maps_filtered_video_and_source_audio(self):
+        """The filtered video is mapped explicitly, with the source's audio if any."""
+        args = label_overlay_args(self.SPECS)
+        self.assertIn("[labelled]", args)
+        self.assertIn("0:a:0?", args)
+
+
+class TestReviewMode(unittest.TestCase):
+    """Test that --review forces labelled re-encodes."""
+
+    def _one_fake_video(self, tmpdir_path):
+        fake = tmpdir_path / "test.mp4"
+        fake.write_bytes(b'\x00\x00\x00\x00')
+        return fake
+
+    MATCHING_SPECS = {
+        'codec': 'h264', 'width': 1920, 'height': 1080,
+        'fps': 30.0, 'duration': 10.0,
+    }
+
+    @patch('concat_clips.concat_clips.HAS_OPENCV', True)
+    @patch('concat_clips.concat_clips.render_review_label')
+    @patch('concat_clips.concat_clips.reencode_video')
+    @patch('concat_clips.concat_clips.get_video_specs')
+    def test_review_reencodes_an_otherwise_untouched_clip(self, mock_get_specs,
+                                                          mock_reencode, mock_render):
+        """A clip whose specs match still gets re-encoded so the label is burned in."""
+        mock_get_specs.return_value = dict(self.MATCHING_SPECS)
+        mock_reencode.return_value = True
+        mock_render.return_value = True
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake = self._one_fake_video(tmpdir_path)
+
+            try:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[fake],
+                    output_path=tmpdir_path / "output.mp4",
+                    review=True,
+                )
+            except Exception:
+                pass
+
+            # The label was rendered from the clip's own filename...
+            self.assertTrue(mock_render.called)
+            self.assertEqual(mock_render.call_args.args[0], "test.mp4")
+            # ...and handed to the re-encode that burns it in.
+            self.assertTrue(mock_reencode.called,
+                "review mode must re-encode even a clip whose specs match")
+            label_image = mock_reencode.call_args.kwargs.get("label_image")
+            self.assertIsNotNone(label_image, "The re-encode should receive the label image")
+
+    @patch('concat_clips.concat_clips.reencode_video')
+    @patch('concat_clips.concat_clips.get_video_specs')
+    def test_without_review_a_matching_clip_is_used_untouched(self, mock_get_specs, mock_reencode):
+        """The existing fast path is preserved when review is off."""
+        mock_get_specs.return_value = dict(self.MATCHING_SPECS)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            fake = self._one_fake_video(tmpdir_path)
+
+            try:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[fake],
+                    output_path=tmpdir_path / "output.mp4",
+                )
+            except Exception:
+                pass
+
+            mock_reencode.assert_not_called()
+
+    @patch('concat_clips.concat_clips.HAS_OPENCV', False)
+    def test_review_without_opencv_raises(self):
+        """Rendering labels needs OpenCV and says so."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmpdir_path = Path(tmpdir)
+            with self.assertRaises(RuntimeError) as ctx:
+                concatenate_videos(
+                    ffmpeg_exe="ffmpeg",
+                    ffprobe_exe="ffprobe",
+                    video_files=[self._one_fake_video(tmpdir_path)],
+                    output_path=tmpdir_path / "output.mp4",
+                    review=True,
+                )
+            self.assertIn("OpenCV", str(ctx.exception))
+
+
 class TestDocumentation(unittest.TestCase):
     """Test that the module docstring mentions the new options."""
 
@@ -1138,6 +1295,11 @@ class TestDocumentation(unittest.TestCase):
         from concat_clips.concat_clips import __doc__ as module_doc
         self.assertIn("asc", module_doc)
         self.assertIn("desc", module_doc)
+
+    def test_module_mentions_review(self):
+        """Verify the docstring mentions --review."""
+        from concat_clips.concat_clips import __doc__ as module_doc
+        self.assertIn("--review", module_doc)
 
 
 if __name__ == "__main__":
